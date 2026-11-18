@@ -34,7 +34,10 @@ function connect() {
   ws.addEventListener('open', async () => {
     try {
       const result = await request(session.host ? 'host' : 'join', { token: session.token, name: session.name });
-      if (result.token) { session.token = result.token; saveSession(); }
+      if (result.token) {
+        session.token = result.token; saveSession();
+        if (!session.host) history.replaceState(null, '', `/join?code=${session.code}`);
+      }
       document.querySelector('#connection').textContent = `LIVE · ROOM ${session.code}`;
     } catch (e) { forgetSession(e.message); ws.close(); }
   });
