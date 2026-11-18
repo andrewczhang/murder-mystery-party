@@ -1,5 +1,5 @@
 import page from './public/index.html';
-import { isMock, generateMystery, questions, reaction } from './ai.js';
+import { isMock, generateMystery, questions, reaction, withDeadline } from './ai.js';
 
 const reply = (data, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store' } });
 const fresh = () => ({ phase: 'lobby', players: [], round: 0, answers: {}, votes: {}, questions: [], revision: 0 });
@@ -152,9 +152,16 @@ export class Room {
     if (this.speaking) return new Response('Please use browser voice', { status: 429 });
     this.speaking = true;
     try {
-      const audio = await this.env.AI.run('@cf/deepgram/aura-1', { text: data.text, speaker: 'orion', encoding: 'mp3' });
-      const bytes = await new Response(audio).arrayBuffer();
-      if (!bytes.byteLength) throw new Error('Empty audio');
+      const bytes = await withDeadline((async () => {
+        const audio = await this.env.AI.run('@cf/deepgram/aura-1', { text: data.text, speaker: 'orion', encoding: 'mp3' });
+        if (audio instanceof Response) {
+          if (!audio.ok || !audio.headers.get('Content-Type')?.startsWith('audio/')) throw new Error('Invalid audio response');
+          return audio.arrayBuffer();
+        }
+        if (!(audio instanceof ReadableStream) && !(audio instanceof ArrayBuffer) && !ArrayBuffer.isView(audio)) throw new Error('Invalid audio response');
+        return new Response(audio).arrayBuffer();
+      })(), 25000);
+      if (bytes.byteLength < 128) throw new Error('Empty or invalid audio');
       if (this.audioCache.size >= 12) this.audioCache.delete(this.audioCache.keys().next().value);
       this.audioCache.set(data.text, bytes);
       return new Response(bytes, { headers: { 'Content-Type': 'audio/mpeg' } });

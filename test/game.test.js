@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cannedMystery, validateMystery, generateMystery, isMock } from '../ai.js';
+import { cannedMystery, validateMystery, generateMystery, questions, reaction, isMock, withDeadline } from '../ai.js';
 import { Room } from '../dist/worker.js';
 
 const players = Array.from({ length: 4 }, (_, i) => ({ id: `p${i}`, name: `Guest ${i}` }));
@@ -19,10 +19,48 @@ test('rejects empty, duplicate, missing-player and multiple-killer mysteries', (
 });
 test('AI retries once on malformed output and validates the successful retry', async () => {
   let calls = 0;
-  const env = { AI: { run: async () => ({ response: ++calls === 1 ? '{}' : JSON.stringify(cannedMystery(players)) }) } };
+  const modelResult = { ...cannedMystery(players), killerPlayerId: 'p0' };
+  const env = { AI: { run: async (_model, input) => {
+    assert.equal(input.response_format.type, 'json_schema');
+    assert.deepEqual(input.response_format.json_schema.properties.killerPlayerId.enum, players.map(p => p.id));
+    return { response: ++calls === 1 ? '{}' : JSON.stringify(modelResult) };
+  } } };
   assert.equal((await generateMystery(env, players)).characters.length, 4); assert.equal(calls, 2);
   calls = 0; env.AI.run = async () => { calls++; throw new Error('AI offline'); };
   await assert.rejects(generateMystery(env, players), /AI service could not complete/); assert.equal(calls, 2);
+});
+test('one authoritative killer identity overrides conflicting model flags', async () => {
+  const result = { ...cannedMystery(players), killerPlayerId: 'p1' };
+  Object.assign(result.characters[1], { motive: 'Inheritance', method: 'Poisoned port', tips: 'Deny entering the study' });
+  result.characters.forEach(c => { c.killer = true; });
+  const generated = await generateMystery({ AI: { run: async () => ({ response: result }) } }, players);
+  assert.deepEqual(generated.characters.filter(c => c.killer).map(c => c.playerId), ['p1']);
+});
+test('missing or invalid killer identity falls back to one explicit flag or random assignment', async () => {
+  for (const identity of [undefined, 'unknown']) for (const flagged of [true, false]) {
+    const result = { ...cannedMystery(players), killerPlayerId: identity };
+    if (!flagged) result.characters.forEach(c => { delete c.killer; delete c.motive; delete c.method; delete c.tips; });
+    const generated = await generateMystery({ AI: { run: async () => ({ response: result }) } }, players);
+    const killers = generated.characters.filter(c => c.killer); assert.equal(killers.length, 1);
+    if (flagged) assert.equal(killers[0].playerId, 'p0');
+    else { assert.ok(killers[0].motive); assert.ok(killers[0].method); assert.ok(killers[0].tips); assert.ok(generated.solution.includes(killers[0].name)); }
+  }
+});
+test('missing players still fail after one retry', async () => {
+  const result = { ...cannedMystery(players), killerPlayerId: 'p0' }; result.characters.pop(); let calls = 0;
+  await assert.rejects(generateMystery({ AI: { run: async () => { calls++; return { response: result }; } } }, players)); assert.equal(calls, 2);
+});
+test('detective JSON schemas use small token budgets and reject malformed questions', async () => {
+  const mystery = cannedMystery(players); let nextResponse = { questions: [{ playerId: 'p0', text: 'Where were you?' }, { playerId: 'p1', text: 'Who saw you?' }] };
+  const env = { AI: { run: async (_model, input) => { assert.equal(input.response_format.type, 'json_schema'); assert.ok(input.max_tokens <= 700); return { response: nextResponse }; } } };
+  assert.equal((await questions(env, mystery, 1)).length, 2);
+  nextResponse = { questions: [{ playerId: 'missing', text: 'Where?' }] };
+  await assert.rejects(questions(env, mystery, 1), /Invalid detective questions/);
+  nextResponse = { text: 'Your story is convenient.' }; assert.equal(await reaction(env, mystery, {}), nextResponse.text);
+});
+test('model deadlines release callers instead of hanging the room indefinitely', async () => {
+  await assert.rejects(withDeadline(new Promise(() => {}), 5), /timed out/);
+  assert.equal(await withDeadline(Promise.resolve('ready'), 5), 'ready');
 });
 test('model-added properties cannot smuggle other private cards into responses', () => {
   const m = cannedMystery(players); m.characters[0].otherSecrets = 'PRIVATE'; m.rawMystery = 'PRIVATE';
@@ -53,7 +91,7 @@ test('Workers AI TTS returns audio, caches text, rejects errors and invalid auth
   const mystery = cannedMystery(players);
   const storage = new Map([['room', { code: 'TEST', hostToken: 'host', phase: 'intro', players, mystery, answers: {}, votes: {}, questions: [] }]]);
   let calls = 0;
-  const ctx = context(storage); const room = new Room(ctx, { AI: { run: async (model, input) => { calls++; assert.equal(model, '@cf/deepgram/aura-1'); assert.equal(input.speaker, 'orion'); return new Uint8Array([1, 2, 3]); } } }); await ctx.ready;
+  const ctx = context(storage); const room = new Room(ctx, { AI: { run: async (model, input) => { calls++; assert.equal(model, '@cf/deepgram/aura-1'); assert.equal(input.speaker, 'orion'); return new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(1024)); controller.close(); } }); } } }); await ctx.ready;
   const request = (token = 'host', text = mystery.intro) => new Request('https://room/api/tts', { method: 'POST', body: JSON.stringify({ token, text }) });
   assert.equal((await room.tts(request('wrong'))).status, 403);
   assert.equal((await room.tts(request('host', 'arbitrary'))).status, 400);
@@ -61,4 +99,8 @@ test('Workers AI TTS returns audio, caches text, rejects errors and invalid auth
   assert.equal((await room.tts(request())).status, 200); assert.equal(calls, 1);
   room.audioCache.clear(); room.env.AI.run = async () => { throw new Error('429'); };
   assert.equal((await room.tts(request())).status, 503);
+  for (const invalid of [{ error: 'rate limited' }, new Uint8Array(), new Response('Bad gateway', { status: 502 })]) {
+    room.env.AI.run = async () => invalid;
+    assert.equal((await room.tts(request())).status, 503);
+  }
 });
