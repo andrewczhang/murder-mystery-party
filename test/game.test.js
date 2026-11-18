@@ -33,6 +33,15 @@ function context(storage) {
   const ctx = { storage: { get: async key => structuredClone(storage.get(key)), put: async (key, value) => storage.set(key, structuredClone(value)) }, getWebSockets: () => [], blockConcurrencyWhile: fn => { ctx.ready = Promise.resolve().then(fn); } };
   return ctx;
 }
+test('room status reports missing rooms without exposing existing room capabilities', async () => {
+  for (const exists of [false, true]) {
+    const ctx = context(new Map(exists ? [['room', { hostToken: 'private-host', players: [] }]] : []));
+    const room = new Room(ctx, {}); await ctx.ready;
+    const response = await room.fetch(new Request('https://room/status'));
+    assert.equal(response.status, exists ? 200 : 404);
+    if (exists) assert.deepEqual(await response.json(), { exists: true });
+  }
+});
 test('Durable Object reload retains private role and clears interrupted busy flag', async () => {
   const storage = new Map([['room', { code: 'TEST', phase: 'intro', players, mystery: cannedMystery(players), busy: true }]]);
   const ctx = context(storage); const room = new Room(ctx, {}); await ctx.ready;

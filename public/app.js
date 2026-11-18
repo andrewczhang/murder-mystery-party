@@ -5,6 +5,7 @@ const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': 
 const queryCode = new URLSearchParams(location.search).get('code')?.toUpperCase() || '';
 const store = {
   get(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } },
+  remove(key) { try { localStorage.removeItem(key); } catch { /* Storage may be disabled. */ } },
   set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { toast('Storage is unavailable. Keep this tab open to retain your role.'); } }
 };
 let session, ws, state, joinMode = location.pathname === '/join', sound = true, speechKey = '', revealed = false, reconnectTimer, toastTimer, audio, audioUrl, voiceGeneration = 0, draft = '', draftRound = 0;
@@ -20,6 +21,12 @@ function request(type, data = {}) {
   });
 }
 function saveSession() { store.set(session.host ? 'dn-host' : `dn-player-${session.code}`, session); }
+function forgetSession(message) {
+  if (session) store.remove(session.host ? 'dn-host' : `dn-player-${session.code}`);
+  clearTimeout(reconnectTimer); session = null; state = null; speechKey = ''; stopVoice();
+  document.querySelector('#connection').textContent = 'AN EVENING OF ALIBIS';
+  render(); toast(message);
+}
 function connect() {
   clearTimeout(reconnectTimer);
   document.querySelector('#connection').textContent = 'CONNECTING TO THE MANOR';
@@ -29,7 +36,7 @@ function connect() {
       const result = await request(session.host ? 'host' : 'join', { token: session.token, name: session.name });
       if (result.token) { session.token = result.token; saveSession(); }
       document.querySelector('#connection').textContent = `LIVE · ROOM ${session.code}`;
-    } catch (e) { toast(e.message); session = null; ws.close(); state = null; render(); }
+    } catch (e) { forgetSession(e.message); ws.close(); }
   });
   ws.addEventListener('message', event => {
     const message = JSON.parse(event.data);
@@ -44,11 +51,19 @@ function connect() {
       render(); autoNarrate();
     }
   });
-  ws.addEventListener('close', event => {
+  const connection = ws;
+  ws.addEventListener('close', async event => {
+    if (connection !== ws) return;
     for (const entry of pending.values()) { clearTimeout(entry.timeout); entry.reject(new Error('Connection interrupted. Reconnecting…')); } pending.clear();
+    if (!session) return;
     document.querySelector('#connection').textContent = 'DISCONNECTED · RECONNECTING';
-    if (session && event.reason.includes('expired')) { toast(event.reason); session = null; state = null; render(); }
-    else if (session) reconnectTimer = setTimeout(connect, 1800);
+    if (event.reason.includes('expired')) return forgetSession('This room has expired. Start or join another game.');
+    try {
+      const response = await fetch(`/api/rooms/${session.code}`, { signal: AbortSignal.timeout(8000) });
+      if (connection !== ws || !session) return;
+      if (response.status === 404) return forgetSession('Room not found or expired. Check the code or start a new game.');
+    } catch { /* Retry after transient network failures. */ }
+    if (connection === ws && session) reconnectTimer = setTimeout(connect, 1800);
   });
   ws.addEventListener('error', () => toast('Cannot reach the manor. Check your connection.'));
 }

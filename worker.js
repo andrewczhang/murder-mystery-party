@@ -7,6 +7,8 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === '/health') return reply({ ok: true, mock: isMock(env) });
+    const statusCode = url.pathname.match(/^\/api\/rooms\/([A-Z]{4})$/);
+    if (statusCode && request.method === 'GET') return env.ROOMS.get(env.ROOMS.idFromName(statusCode[1])).fetch(new Request('https://room/status'));
     if (url.pathname === '/api/rooms' && request.method === 'POST') {
       for (let i = 0; i < 5; i++) {
         const bytes = crypto.getRandomValues(new Uint8Array(4));
@@ -50,6 +52,7 @@ export class Room {
       return reply({ code: this.room.code, token: this.room.hostToken });
     }
     if (!this.room) return reply({ error: 'Room not found or expired.' }, 404);
+    if (url.pathname === '/status') return reply({ exists: true });
     if (url.pathname.endsWith('/tts')) return this.tts(request);
     if (request.headers.get('Upgrade') !== 'websocket') return new Response('WebSocket required', { status: 426 });
     if (this.ctx.getWebSockets().length >= 40) return new Response('Room connection limit reached', { status: 429 });
