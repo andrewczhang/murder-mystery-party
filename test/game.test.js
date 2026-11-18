@@ -1,106 +1,201 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cannedMystery, validateMystery, generateMystery, questions, reaction, isMock, withDeadline } from '../ai.js';
+import { validateMystery, generateMystery, questions, reaction, isMock, withDeadline } from '../ai.js';
+import { buildCase, banned } from '../cases.js';
+import { narrationChunks } from '../public/narration.js';
 import { Room } from '../dist/worker.js';
 
-const players = Array.from({ length: 4 }, (_, i) => ({ id: `p${i}`, name: `Guest ${i}` }));
-test('mock cases validate for every supported player count', () => {
-  for (let n = 3; n <= 8; n++) {
-    const people = Array.from({ length: n }, (_, i) => ({ id: `p${i}`, name: `Guest ${i}` }));
-    assert.equal(cannedMystery(people).characters.length, n);
+const people = n => Array.from({ length: n }, (_, i) => ({ id: `p${i}`, name: `Guest ${i}`, token: `token${i}` }));
+const players = people(4);
+const fixture = (p = players) => buildCase(p, { seed: 'regression-case' });
+test('seeded classic cases cover 3–8 guests, varied worlds and grounded shareable evidence', () => {
+  const settings = new Set(), eras = new Set(), genres = new Set(), methods = new Set();
+  for (let n = 3; n <= 8; n++) for (let seed = 0; seed < 40; seed++) {
+    const p = people(n), m = validateMystery(buildCase(p, { seed: String(seed) }), p);
+    settings.add(m.settingName); eras.add(m.era); genres.add(m.genre); methods.add(m.methodName);
+    assert.equal(banned.test(JSON.stringify(m)), false);
+    assert.equal(m.characters.filter(c => c.killer).length, 1);
+    assert.equal(m.characters.length, n);
+    for (const c of m.characters) {
+      assert.equal(c.playerName, p.find(p => p.id === c.playerId).name);
+      assert.ok(!p.some(p => p.name === c.name)); assert.notEqual(c.secret, 'None');
+      assert.ok(m.solutionClueIds.includes(c.shareableClueId));
+      assert.ok(c.clues.every(clue => clue.subjectId !== c.playerId));
+    }
+    assert.equal(new Set(m.solutionClueIds).size, n * 2);
+    assert.match(m.solution, /moment to catch/);
   }
+  assert.deepEqual([settings.size, eras.size, genres.size, methods.size], [6, 5, 5, 5]);
+  assert.deepEqual(fixture(), fixture());
+  const first = fixture(), next = buildCase(players, { seed: 'regression-case', previous: first });
+  for (const key of ['settingName', 'era', 'genre', 'methodName']) assert.notEqual(next[key], first[key]);
+  assert.throws(() => buildCase([]));
   assert.equal(isMock({}), true); assert.equal(isMock({ AI: {}, MOCK_AI: '1' }), true);
 });
-test('rejects empty, duplicate, missing-player and multiple-killer mysteries', () => {
+test('validator rejects invalid coverage, timelines, self-clues, unprinted evidence and invented reveal facts', () => {
   assert.throws(() => validateMystery({}, players));
-  for (const change of [m => { m.characters[1].killer = true; }, m => { m.characters[1].playerId = 'p0'; }, m => { m.characters.pop(); }, m => { m.characters[0].clues = []; }, m => { m.title = ''; }]) {
-    const m = cannedMystery(players); change(m); assert.throws(() => validateMystery(m, players));
-  }
+  for (const change of [
+    m => { m.characters.forEach(c => { c.killer = true; }); },
+    m => { m.characters[1].playerId = m.characters[0].playerId; },
+    m => { m.characters.pop(); }, m => { m.characters[0].clues = []; }, m => { m.title = ''; },
+    m => { m.timeOfDeath = 'during dinner'; }, m => { m.timeline[2].time = '00:00'; },
+    m => { m.characters[0].alibiTime = '00:00'; },
+    m => { m.characters[0].clues[0].subjectId = m.characters[0].playerId; },
+    m => { m.solutionClueIds.push('C999'); }, m => { m.solution += ' An unseen fingerprint proves it.'; },
+    m => { m.methodClueId = m.catchClueId; }, m => { m.title = 'Blackstone Manor'; }
+  ]) { const m = fixture(); change(m); assert.throws(() => validateMystery(m, players)); }
 });
-test('AI retries once on malformed output and validates the successful retry', async () => {
-  let calls = 0;
-  const modelResult = { ...cannedMystery(players), killerPlayerId: 'p0' };
+test('one small json_schema call edits the case, repairs invalid citations, and ignores extra properties', async () => {
+  const m = fixture(); let calls = 0;
   const env = { AI: { run: async (_model, input) => {
-    assert.equal(input.response_format.type, 'json_schema');
-    assert.deepEqual(input.response_format.json_schema.properties.killerPlayerId.enum, players.map(p => p.id));
-    return { response: ++calls === 1 ? '{}' : JSON.stringify(modelResult) };
+    calls++; assert.equal(input.response_format.type, 'json_schema'); assert.equal(input.max_tokens, 900);
+    return { response: { title: 'Dead Letters After Dark', voices: players.map(p => ({ playerId: p.id, personality: 'Dry humour; impatient with evasions.' })), revealClueIds: ['C999'], killerPlayerId: 'intruder', solution: 'An invented clue', characters: [] } };
   } } };
-  assert.equal((await generateMystery(env, players)).characters.length, 4); assert.equal(calls, 2);
-  calls = 0; env.AI.run = async () => { calls++; throw new Error('AI offline'); };
-  await assert.rejects(generateMystery(env, players), /AI service could not complete/); assert.equal(calls, 2);
+  const generated = await generateMystery(env, players, { seed: m.seed });
+  assert.equal(generated.source, 'ai'); assert.equal(calls, 1);
+  assert.deepEqual(generated.solutionClueIds, m.solutionClueIds); assert.equal(generated.solution, m.solution);
+  assert.equal(generated.killerPlayerId, undefined);
 });
-test('one authoritative killer identity overrides conflicting model flags', async () => {
-  const result = { ...cannedMystery(players), killerPlayerId: 'p1' };
-  Object.assign(result.characters[1], { motive: 'Inheritance', method: 'Poisoned port', tips: 'Deny entering the study' });
-  result.characters.forEach(c => { c.killer = true; });
-  const generated = await generateMystery({ AI: { run: async () => ({ response: result }) } }, players);
-  assert.deepEqual(generated.characters.filter(c => c.killer).map(c => c.playerId), ['p1']);
+test('quota 4006/429, malformed output, bad edits and any AI error fall back immediately without retries', async () => {
+  for (const failure of [new Error('429: code 4006 daily allocation exceeded'), new Error('network unavailable'), '{', {}, { title: 'Mansion of Deceit', voices: [] }]) {
+    let calls = 0;
+    const env = { AI: { run: async () => { calls++; if (failure instanceof Error) throw failure; return { response: failure }; } } };
+    const m = await generateMystery(env, players, { seed: 'failure' });
+    assert.equal(m.source, 'classic'); assert.equal(calls, 1); validateMystery(m, players);
+    if (failure instanceof Error && /4006/.test(failure.message)) assert.equal(m.quotaLimited, true);
+  }
+  const m = await generateMystery({ AI: { run: async () => ({ errors: [{ code: 4006, message: 'quota' }] }) } }, players);
+  assert.equal(m.quotaLimited, true);
 });
-test('missing or invalid killer identity falls back to one explicit flag or random assignment', async () => {
-  for (const identity of [undefined, 'unknown']) for (const flagged of [true, false]) {
-    const result = { ...cannedMystery(players), killerPlayerId: identity };
-    if (!flagged) result.characters.forEach(c => { delete c.killer; delete c.motive; delete c.method; delete c.tips; });
-    const generated = await generateMystery({ AI: { run: async () => ({ response: result }) } }, players);
-    const killers = generated.characters.filter(c => c.killer); assert.equal(killers.length, 1);
-    if (flagged) assert.equal(killers[0].playerId, 'p0');
-    else { assert.ok(killers[0].motive); assert.ok(killers[0].method); assert.ok(killers[0].tips); assert.ok(generated.solution.includes(killers[0].name)); }
+test('questions are balanced, nonrepeating and reference only the addressee’s printed shareable clue', async () => {
+  const env = { AI: { run: () => { throw new Error('Detective must not call AI'); } } };
+  for (let n = 3; n <= 8; n++) {
+    const m = fixture(people(n)), counts = Object.fromEntries(m.characters.map(c => [c.playerId, 0])), lines = [];
+    for (let round = 1; round <= 3; round++) {
+      const qs = await questions(env, m, round); assert.equal(qs.length, 3);
+      assert.equal(new Set(qs.map(q => q.playerId)).size, 3);
+      for (const q of qs) { counts[q.playerId]++; const c = m.characters.find(c => c.playerId === q.playerId); assert.ok(q.text.includes(c.shareableClueId)); assert.ok(!q.text.includes(c.secret)); lines.push(q.text); }
+    }
+    assert.equal(new Set(lines).size, 9);
+    assert.ok(Math.max(...Object.values(counts)) - Math.min(...Object.values(counts)) <= 1);
+    assert.ok(Object.values(counts).every(n => n >= 1));
   }
 });
-test('missing players still fail after one retry', async () => {
-  const result = { ...cannedMystery(players), killerPlayerId: 'p0' }; result.characters.pop(); let calls = 0;
-  await assert.rejects(generateMystery({ AI: { run: async () => { calls++; return { response: result }; } } }, players)); assert.equal(calls, 2);
+test('reactions quote actual answers, distinguish rounds, handle empty input and never call AI', async () => {
+  const m = fixture(), env = { AI: { run: () => { throw new Error('No AI'); } } };
+  const lines = await Promise.all([1, 2, 3].map(round => reaction(env, m, { p0: 'I checked the entry recorder.' }, round)));
+  assert.equal(new Set(lines).size, 3); lines.forEach(line => assert.ok(line.includes('I checked the entry recorder.')));
+  assert.match(await reaction(env, m, {}), /No statements/);
 });
-test('detective JSON schemas use small token budgets and reject malformed questions', async () => {
-  const mystery = cannedMystery(players); let nextResponse = { questions: [{ playerId: 'p0', text: 'Where were you?' }, { playerId: 'p1', text: 'Who saw you?' }] };
-  const env = { AI: { run: async (_model, input) => { assert.equal(input.response_format.type, 'json_schema'); assert.ok(input.max_tokens <= 700); return { response: nextResponse }; } } };
-  assert.equal((await questions(env, mystery, 1)).length, 2);
-  nextResponse = { questions: [{ playerId: 'missing', text: 'Where?' }] };
-  await assert.rejects(questions(env, mystery, 1), /Invalid detective questions/);
-  nextResponse = { text: 'Your story is convenient.' }; assert.equal(await reaction(env, mystery, {}), nextResponse.text);
-});
-test('model deadlines release callers instead of hanging the room indefinitely', async () => {
+test('model deadline releases a hung caller', async () => {
   await assert.rejects(withDeadline(new Promise(() => {}), 5), /timed out/);
   assert.equal(await withDeadline(Promise.resolve('ready'), 5), 'ready');
 });
-test('model-added properties cannot smuggle other private cards into responses', () => {
-  const m = cannedMystery(players); m.characters[0].otherSecrets = 'PRIVATE'; m.rawMystery = 'PRIVATE';
-  const clean = validateMystery(m, players);
-  assert.equal(clean.rawMystery, undefined); assert.equal(clean.characters[0].otherSecrets, undefined);
+test('narration splits a long reveal into bounded sentence/word chunks without dropping text', () => {
+  assert.deepEqual(narrationChunks(''), []);
+  const text = fixture(people(8)).solution, chunks = narrationChunks(text);
+  assert.ok(chunks.length > 10); assert.ok(chunks.every(c => c.length <= 260));
+  assert.equal(chunks.join(' '), text.replace(/\s+/g, ' ').trim());
 });
-function context(storage) {
-  const ctx = { storage: { get: async key => structuredClone(storage.get(key)), put: async (key, value) => storage.set(key, structuredClone(value)) }, getWebSockets: () => [], blockConcurrencyWhile: fn => { ctx.ready = Promise.resolve().then(fn); } };
+function context(storage = new Map()) {
+  const ctx = { sockets: [], storage: { get: async key => structuredClone(storage.get(key)), put: async (key, value) => storage.set(key, structuredClone(value)), setAlarm: async time => { ctx.alarmAt = time; }, deleteAll: async () => storage.clear() }, getWebSockets: () => ctx.sockets, blockConcurrencyWhile: fn => { ctx.ready = Promise.resolve().then(fn); } };
   return ctx;
 }
-test('room status reports missing rooms without exposing existing room capabilities', async () => {
-  for (const exists of [false, true]) {
-    const ctx = context(new Map(exists ? [['room', { hostToken: 'private-host', players: [] }]] : []));
-    const room = new Room(ctx, {}); await ctx.ready;
-    const response = await room.fetch(new Request('https://room/status'));
-    assert.equal(response.status, exists ? 200 : 404);
-    if (exists) assert.deepEqual(await response.json(), { exists: true });
+function socket(auth = {}) { return { auth, messages: [], deserializeAttachment() { return this.auth; }, serializeAttachment(a) { this.auth = a; }, send(m) { this.messages.push(JSON.parse(m)); }, close() {} }; }
+async function roomFixture(n = 4, env = {}) {
+  const players = people(n).map(p => ({ ...p, lastSeen: Date.now() }));
+  const storage = new Map([['room', { code: 'TEST', hostToken: 'host', phase: 'lobby', players, round: 0, revision: 0, answers: {}, votes: {}, questions: [], expiresAt: Date.now() + 86400000 }]]);
+  const ctx = context(storage), room = new Room(ctx, env); await ctx.ready; return { room, ctx, storage };
+}
+test('room status does not expose capabilities; interrupted preparation has a retry message', async () => {
+  const missing = new Room(context(), {}); await missing.ctx.ready;
+  assert.equal((await missing.fetch(new Request('https://room/status'))).status, 404);
+  const { room, storage } = await roomFixture();
+  assert.deepEqual(await (await room.fetch(new Request('https://room/status'))).json(), { exists: true });
+  room.room.busy = true; await room.save();
+  const ctx = context(storage), restored = new Room(ctx, {}); await ctx.ready;
+  assert.equal(restored.room.busy, false); assert.match(restored.room.preparationNotice, /begin again/);
+});
+test('pre-upgrade rooms keep their original expiry and legacy private cards remain readable', async () => {
+  const { room, storage } = await roomFixture();
+  room.room.mystery = fixture(); room.room.mystery.characters.forEach(c => { c.clues = c.clues.map(clue => clue.text); delete c.shareableClueId; delete c.playerName; });
+  delete room.room.expiresAt; await room.save();
+  const ctx = context(storage), deadline = Date.now() + 60000; ctx.storage.getAlarm = async () => deadline;
+  const restored = new Room(ctx, {}); await ctx.ready;
+  assert.equal(restored.room.expiresAt, deadline);
+  const view = restored.view({ playerId: 'p0' });
+  assert.equal(view.role.playerName, players[0].name); assert.equal(view.role.clues[0].id, view.role.shareableClueId); assert.ok(view.role.clues[0].text);
+  assert.equal(view.characters[0].playerName, players[0].name);
+});
+test('room rejects duplicate names case-insensitively but reconnect token recovers the existing seat', async () => {
+  const { room, ctx } = await roomFixture();
+  const ws = socket(); ctx.sockets.push(ws);
+  await room.webSocketMessage(ws, JSON.stringify({ type: 'join', name: '  gUEst 0  ', id: 1 }));
+  assert.match(ws.messages.at(-1).error, /already on the guest list/); assert.equal(room.room.players.length, 4);
+  await room.webSocketMessage(ws, JSON.stringify({ type: 'join', token: 'token0', id: 2 }));
+  assert.equal(ws.messages.at(-1).ok, true); assert.equal(room.room.players.length, 4);
+});
+test('presence expires silent sockets at six seconds, frees only lobby seats at fifteen, preserves active roles', async () => {
+  const { room, ctx } = await roomFixture();
+  const ws = socket({ playerId: 'p0', lastSeen: Date.now() }); ctx.sockets.push(ws);
+  assert.equal(room.view({ host: true }).players[0].online, true);
+  ws.auth.lastSeen -= 7000; room.room.players[0].lastSeen -= 7000;
+  await room.alarm(); assert.equal(room.view({ host: true }).players[0].online, false);
+  room.room.players[0].lastSeen -= 10000; ws.auth.lastSeen -= 10000;
+  await room.alarm(); assert.equal(room.room.players.some(p => p.id === 'p0'), false);
+  room.room.phase = 'intro'; room.room.players[0].lastSeen -= 20000;
+  await room.alarm(); assert.equal(room.room.players.length, 3);
+});
+test('close broadcasts offline immediately, heartbeat restores it, and the room still expires after 24 hours', async () => {
+  const { room, ctx, storage } = await roomFixture();
+  const guest = socket({ playerId: 'p0', lastSeen: Date.now() }), host = socket({ host: true }); ctx.sockets.push(guest, host);
+  await room.webSocketClose(guest, 1000, '');
+  assert.equal(host.messages.filter(m => m.type === 'state').at(-1).state.players[0].online, false);
+  guest.auth = { playerId: 'p0', lastSeen: Date.now() - 9000 };
+  await room.webSocketMessage(guest, JSON.stringify({ type: 'ping', id: 1 }));
+  assert.equal(room.online('p0'), true);
+  room.room.expiresAt = Date.now() - 1; await room.alarm(); assert.equal(storage.size, 0);
+});
+test('reserved WebSocket close codes are never echoed onto the wire', async () => {
+  for (const reserved of [1005, 1006, 1015]) {
+    const { room, ctx } = await roomFixture(); const ws = socket({ playerId: 'p0', lastSeen: Date.now() }); ctx.sockets.push(ws);
+    ws.close = code => assert.equal(code, 1000);
+    await room.webSocketClose(ws, reserved, ''); assert.equal(room.online('p0'), false);
   }
 });
-test('Durable Object reload retains private role and clears interrupted busy flag', async () => {
-  const storage = new Map([['room', { code: 'TEST', phase: 'intro', players, mystery: cannedMystery(players), busy: true }]]);
-  const ctx = context(storage); const room = new Room(ctx, {}); await ctx.ready;
-  assert.equal(room.room.busy, false); assert.equal(room.room.phase, 'intro');
-  assert.equal(room.room.mystery.characters[0].secret, cannedMystery(players).characters[0].secret);
-  assert.equal(storage.get('room').busy, false);
+test('3–8 player games finish with an exhausted AI allocation, including the last reaction and vote-aware reveal', async () => {
+  for (let n = 3; n <= 8; n++) {
+    let calls = 0; const { room } = await roomFixture(n, { AI: { run: async () => { calls++; throw new Error('429: 4006'); } } });
+    await room.advance(); assert.equal(room.room.mystery.source, 'classic');
+    const host = room.view({ host: true }); assert.equal(host.role, undefined); assert.ok(host.characters.every(c => c.secret === undefined));
+    const own = room.view({ playerId: 'p0' }).role; assert.ok(own.clues.every(c => c.explanation === undefined && c.kind === undefined));
+    for (let round = 1; round <= 3; round++) { await room.advance(); room.room.answers = Object.fromEntries(room.room.questions.map(q => [q.playerId, `My statement in round ${round}`])); await room.advance(); assert.equal(room.room.phase, 'reaction'); }
+    await room.advance(); assert.equal(room.room.phase, 'voting');
+    const killer = room.room.mystery.characters.find(c => c.killer).playerId;
+    room.room.votes = Object.fromEntries(room.room.players.map(p => [p.id, p.id === killer ? room.room.players.find(p => p.id !== killer).id : killer]));
+    await room.advance(); const reveal = room.view({ host: true }).reveal;
+    assert.equal(reveal.killerWins, false); assert.match(reveal.solution, new RegExp(`${n - 1} of ${n} votes`)); assert.equal(calls, 1);
+    await room.advance(); assert.equal(room.room.phase, 'lobby'); assert.equal(room.room.mystery, undefined);
+  }
 });
-test('Workers AI TTS returns audio, caches text, rejects errors and invalid auth', async () => {
-  const mystery = cannedMystery(players);
-  const storage = new Map([['room', { code: 'TEST', hostToken: 'host', phase: 'intro', players, mystery, answers: {}, votes: {}, questions: [] }]]);
+test('TTS accepts only current narration chunks, caches audio, and stops calling a failed voice service', async () => {
   let calls = 0;
-  const ctx = context(storage); const room = new Room(ctx, { AI: { run: async (model, input) => { calls++; assert.equal(model, '@cf/deepgram/aura-1'); assert.equal(input.speaker, 'orion'); return new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(1024)); controller.close(); } }); } } }); await ctx.ready;
-  const request = (token = 'host', text = mystery.intro) => new Request('https://room/api/tts', { method: 'POST', body: JSON.stringify({ token, text }) });
+  const { room } = await roomFixture(4, { AI: { run: async (model, input) => { calls++; assert.equal(model, '@cf/deepgram/aura-1'); assert.equal(input.speaker, 'orion'); return new Uint8Array(1024); } } });
+  room.room.mystery = fixture(); room.room.phase = 'intro';
+  const text = narrationChunks(room.room.mystery.intro)[0];
+  const request = (token = 'host', value = text) => new Request('https://room/api/tts', { method: 'POST', body: JSON.stringify({ token, text: value }) });
   assert.equal((await room.tts(request('wrong'))).status, 403);
   assert.equal((await room.tts(request('host', 'arbitrary'))).status, 400);
+  assert.equal((await room.tts(request('host', narrationChunks(room.room.mystery.solution)[0]))).status, 400);
   assert.equal((await room.tts(request())).headers.get('Content-Type'), 'audio/mpeg');
   assert.equal((await room.tts(request())).status, 200); assert.equal(calls, 1);
-  room.audioCache.clear(); room.env.AI.run = async () => { throw new Error('429'); };
-  assert.equal((await room.tts(request())).status, 503);
+  room.audioCache.clear(); room.env.AI.run = async () => { calls++; throw new Error('429'); };
+  assert.equal((await room.tts(request())).status, 503); assert.equal(calls, 2);
+  assert.equal((await room.tts(request())).status, 503); assert.equal(calls, 2);
   for (const invalid of [{ error: 'rate limited' }, new Uint8Array(), new Response('Bad gateway', { status: 502 })]) {
-    room.env.AI.run = async () => invalid;
-    assert.equal((await room.tts(request())).status, 503);
+    room.room.voiceUnavailable = false; room.env.AI.run = async () => invalid; assert.equal((await room.tts(request())).status, 503);
   }
+  room.room.voiceUnavailable = false; room.room.mystery.quotaLimited = true;
+  room.env.AI.run = () => { throw new Error('Quota guard failed'); };
+  assert.equal((await room.tts(request())).status, 503);
 });
