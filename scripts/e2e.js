@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import WebSocket from 'ws';
+import { writeFile } from 'node:fs/promises';
 
 const base = process.env.TEST_URL || 'http://127.0.0.1:8787';
 const clients = [];
@@ -14,11 +15,12 @@ async function client(code) {
   await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
   c.send = (type, data = {}) => new Promise((resolve, reject) => {
     const id = ++c.sequence;
-    const timeout = setTimeout(() => reject(new Error(`Timeout: ${type}`)), 20000);
+    const timeout = setTimeout(() => reject(new Error(`Timeout: ${type}`)), 30000);
     c.pending.set(id, result => { clearTimeout(timeout); resolve(result); });
     ws.send(JSON.stringify({ id, type, ...data }));
   });
   c.ok = async (type, data) => { const result = await c.send(type, data); assert.equal(result.ok, true, result.error); return result; };
+  c.heartbeat = setInterval(() => { if (c.state && ws.readyState === WebSocket.OPEN) c.send('ping').catch(() => {}); }, 2000);
   return c;
 }
 const next = c => c.ok('next', { revision: c.state.revision });
@@ -49,9 +51,10 @@ try {
     const p = await client(invitation.code); p.identity = await p.ok('join', { name }); players.push(p);
   }
   assert.equal(host.state.players.length, 4);
+  assert.equal((await intruder.send('join', { name: '  aDA  ' })).ok, false, 'Duplicate names are rejected case-insensitively');
   assert.equal((await players[0].send('next', { revision: 0 })).ok, false);
   console.log('PASS lobby: 4 players, room code, auth, empty-name and minimum-player guards');
-  await next(host); assert.equal(host.state.phase, 'intro'); privacy(host, players);
+  const started = Date.now(); await next(host); console.log(`Mock case ready in ${Date.now() - started} ms`); assert.equal(host.state.phase, 'intro'); privacy(host, players);
   assert.equal(players.filter(p => p.state.role.killer).length, 1);
   assert.equal((await intruder.send('join', { name: 'Late' })).ok, false);
   const roleBefore = players[0].state.role;
@@ -64,16 +67,20 @@ try {
   const mockTts = await fetch(`${base}/api/tts?code=${invitation.code}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: invitation.token, text: host.state.public.intro }) }); assert.equal(mockTts.status, 503);
   console.log('PASS roles: exactly one killer, per-socket privacy, host/player refresh, late-join guard, TTS auth/fallback');
   async function rounds() {
+    const asked = [], counts = Object.fromEntries(players.map(p => [p.state.me, 0]));
     for (let round = 1; round <= 3; round++) {
       await next(host); assert.equal(host.state.phase, 'questions'); assert.equal(host.state.round, round);
       assert.equal((await host.send('next', { revision: host.state.revision })).ok, false, 'Missing answers block advancement');
       for (const q of host.state.questions) {
+        asked.push(q.text); counts[q.playerId]++;
         const p = players.find(p => p.state.me === q.playerId); assert.ok(p);
         assert.equal((await p.send('answer', { text: '' })).ok, false);
         await p.ok('answer', { text: 'I was in the conservatory. Ask the others.' });
       }
       privacy(host, players); await next(host); assert.equal(host.state.phase, 'reaction'); assert.ok(host.state.reaction);
     }
+    assert.equal(new Set(asked).size, 9, 'Questions never repeat');
+    assert.ok(Math.max(...Object.values(counts)) - Math.min(...Object.values(counts)) <= 1, 'Questioning is balanced');
     await next(host); assert.equal(host.state.phase, 'voting');
   }
   await rounds(); console.log('PASS detective: all 3 rounds, 3 questions per round, answers, reactions and transition guards');
@@ -85,6 +92,7 @@ try {
   privacy(host, players); assert.equal(host.state.votesCast, 4); await next(host);
   assert.equal(host.state.phase, 'reveal'); assert.equal(host.state.reveal.killerWins, false); assert.equal(host.state.reveal.tally[killer.state.me], 3); assert.ok(host.state.reveal.solution);
   console.log('PASS voting/reveal: no self/invalid votes, secret progress, 3–1 majority catches killer, narrated solution present');
+  if (process.env.MYSTERY_ARTIFACT) await writeFile(process.env.MYSTERY_ARTIFACT, JSON.stringify({ source: 'mock (live check cancelled: AI quota exhausted)', public: host.state.public, characters: players.map(p => p.state.role), reveal: host.state.reveal }, null, 2));
   await next(host); assert.equal(host.state.phase, 'lobby'); assert.equal(host.state.players.length, 4); assert.equal(players[0].state.role, undefined);
   await next(host); await rounds();
   // Two votes for the killer is a tie, not an absolute majority.
@@ -92,6 +100,14 @@ try {
   for (let i = 0; i < 4; i++) await players[i].ok('vote', { playerId: i < 2 ? ids[2] : ids[0] });
   await next(host); assert.equal(host.state.reveal.killerWins, true);
   console.log('PASS replay: same players, cleared roles/votes, second full game, 2–2 split lets killer escape');
+  const large = await (await fetch(`${base}/api/rooms`, { method: 'POST' })).json();
+  host = await client(large.code); await host.ok('host', { token: large.token }); players = [];
+  for (let i = 0; i < 8; i++) { const p = await client(large.code); p.identity = await p.ok('join', { name: `Suspect ${i + 1}` }); players.push(p); }
+  await next(host); await rounds();
+  const culprit = players.find(p => p.state.role.killer);
+  for (const p of players) await p.ok('vote', { playerId: p === culprit ? players.find(o => o !== culprit).state.me : culprit.state.me });
+  await next(host); assert.equal(host.state.phase, 'reveal'); assert.equal(host.state.reveal.killerWins, false);
+  console.log('PASS eight guests: nine unique balanced questions, final reaction, voting and reveal complete without AI');
   console.log('E2E PASS — lobby → private roles → 3 rounds → voting → reveal → replay (mock Workers AI)');
 } catch (error) { console.error(error); process.exitCode = 1; }
-finally { for (const c of clients) c.ws.terminate(); }
+finally { for (const c of clients) { clearInterval(c.heartbeat); c.ws.terminate(); } }
