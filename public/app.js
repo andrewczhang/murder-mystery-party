@@ -39,7 +39,7 @@ function connect() {
         if (!session.host) history.replaceState(null, '', `/join?code=${session.code}`);
       }
       document.querySelector('#connection').textContent = `LIVE · ROOM ${session.code}`;
-    } catch (e) { forgetSession(e.message); ws.close(); }
+    } catch (e) { if (e.interrupted) return; forgetSession(e.message); ws.close(); }
   });
   ws.addEventListener('message', event => {
     const message = JSON.parse(event.data);
@@ -57,7 +57,7 @@ function connect() {
   const connection = ws;
   ws.addEventListener('close', async event => {
     if (connection !== ws) return;
-    for (const entry of pending.values()) { clearTimeout(entry.timeout); entry.reject(new Error('Connection interrupted. Reconnecting…')); } pending.clear();
+    for (const entry of pending.values()) { clearTimeout(entry.timeout); entry.reject(Object.assign(new Error('Connection interrupted. Reconnecting…'), { interrupted: true })); } pending.clear();
     if (!session) return;
     document.querySelector('#connection').textContent = 'DISCONNECTED · RECONNECTING';
     if (event.reason.includes('expired')) return forgetSession('This room has expired. Start or join another game.');
