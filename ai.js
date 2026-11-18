@@ -21,6 +21,7 @@ export function validateMystery(m, players) {
   const references = [...m.solution.matchAll(/\[(C\d+)\]/g)].map(match => match[1]);
   if (!Array.isArray(m.timeline) || m.timeline.length !== 3 || m.timeline[1].time !== m.timeOfDeath || !m.timeline.every(t => /^([01]\d|2[0-3]):[0-5]\d$/.test(t.time)) || m.timeline[0].time >= m.timeOfDeath || m.timeline[2].time <= m.timeOfDeath || !m.intro.includes(m.timeline[2].time)) throw new Error('Inconsistent timeline');
   if (clues.find(c => c.id === m.methodClueId)?.kind !== 'method' || clues.find(c => c.id === m.catchClueId)?.kind !== 'opportunity' || clues.find(c => c.id === m.motiveClueId)?.kind !== 'motive') throw new Error('Missing proof');
+  if (m.pacedEvidence && (clues.some(c => ![1, 2, 3].includes(c.unlockRound)) || m.characters.some(c => !c.clues.some(clue => clue.unlockRound === 1)) || clues.find(c => c.id === m.methodClueId).unlockRound !== 2 || clues.find(c => c.id === m.motiveClueId).unlockRound !== 2 || clues.find(c => c.id === m.catchClueId).unlockRound !== 3)) throw new Error('Invalid evidence pacing');
   if (!Array.isArray(m.solutionClueIds) || m.solutionClueIds.some(id => !clueIds.has(id)) || m.characters.some(c => !m.solutionClueIds.includes(c.shareableClueId)) || [m.methodClueId, m.catchClueId, m.motiveClueId].some(id => !m.solutionClueIds.includes(id)) || references.length !== m.solutionClueIds.length || references.some((id, i) => id !== m.solutionClueIds[i]) || m.solution !== caseSolution(m)) throw new Error('Ungrounded reveal');
   if (banned.test([m.title, m.setting, m.intro, m.solution, ...m.characters.map(c => [c.name, c.personality, c.secret].join(' '))].join(' '))) throw new Error('Banned story element');
   return m;
@@ -66,11 +67,23 @@ export async function questions(_env, mystery, round) {
     'Before we accuse anyone, what concrete fact would make you change your mind?',
     'Last chance. Separate motive from opportunity: which printed fact makes your strongest case?'
   ];
-  return Array.from({ length: 3 }, (_, i) => { const index = (round - 1) * 3 + i, c = mystery.characters[index % mystery.characters.length]; return { playerId: c.playerId, text: `${c.name}, read clue ${c.shareableClueId || 'L1'} aloud. ${lines[index]}` }; });
+  return Array.from({ length: 3 }, (_, i) => {
+    const index = (round - 1) * 3 + i, c = mystery.characters[index % mystery.characters.length];
+    const unlocked = c.clues.filter(clue => (clue.unlockRound || 1) <= round);
+    const clue = unlocked.find(clue => clue.unlockRound === round) || unlocked.at(-1);
+    return { playerId: c.playerId, text: `${c.name}, read clue ${clue?.id || c.shareableClueId || 'L1'} aloud. ${lines[index]}` };
+  });
+}
+export function quoteExcerpt(value, limit = 180) {
+  const text = String(value ?? '').trim();
+  if (text.length <= limit) return text;
+  const prefix = text.slice(0, limit - 1);
+  const boundary = prefix.search(/\s+\S*$/u);
+  return `${(boundary > 0 ? prefix.slice(0, boundary) : '').trimEnd()}…`;
 }
 export async function reaction(_env, mystery, answers, round = 1) {
   const openings = ['Words leave fingerprints.', 'The clock is a stubborn witness.', 'Time to separate shadows from evidence.'];
   const followups = ['Who can independently back that statement?', 'Does that fit the recorded death time, or only the story you prefer?', 'Which printed clue supports that claim? Suspicion alone will not convict.'];
-  const statements = Object.entries(answers).map(([id, answer], i) => `${mystery.characters.find(c => c.playerId === id)?.name || 'A witness'} said, “${String(answer).slice(0, 180)}”. ${followups[(round - 1 + i) % followups.length]}`);
+  const statements = Object.entries(answers).map(([id, answer], i) => `${mystery.characters.find(c => c.playerId === id)?.name || 'A witness'} said, “${quoteExcerpt(answer)}”. ${followups[(round - 1 + i) % followups.length]}`);
   return `${openings[(round - 1) % 3]} ${statements.join(' ') || 'No statements reached my desk. Read your printed clues aloud before we draw conclusions.'}`;
 }
