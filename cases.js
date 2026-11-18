@@ -17,6 +17,26 @@ const methods = [
 ];
 const names = ['Vera Quill', 'Idris Voss', 'Cleo Rook', 'Felix Sable', 'Nadia Wren', 'Otis Flint', 'Ada Mercer', 'Jules Pike', 'Ines Cobalt', 'Remy Fenn', 'Tess Lark', 'Noel Marlow', 'Lena Sloane', 'Hugo Penn', 'Mina Callow', 'Eli Moss', 'Sera Hollis', 'Bram Hale', 'Zora Keene', 'Kit Arden', 'Rhea Sol', 'Leon Finch', 'Esther Lune', 'Milo Crest'];
 const roles = ['Patron', 'Archivist', 'Stage designer', 'Accounts clerk', 'Photographer', 'Courier', 'Engineer', 'Journalist'];
+const personalities = [
+  'Effortlessly charming. Offer grand compliments whenever a question gets uncomfortable.',
+  'Precise and dryly funny. Correct small details, especially when nobody asked.',
+  'Theatrical and impulsive. Tell every story as if the room were your stage.',
+  'Soft-spoken and stubborn. Count the costs before you trust a promise.',
+  'Curious and irreverent. Notice appearances, then question what they hide.',
+  'Restless and warm-hearted. Fill awkward silences with nervous chatter.',
+  'Practical and sceptical. Ask how things work before believing anyone’s theory.',
+  'Cool and relentless. Answer a question with a sharper question.'
+];
+const relationships = [
+  'You finance {victim}’s projects and resent being treated as merely a cheque book.',
+  'You preserve {victim}’s private papers. They promised you access to a restricted collection.',
+  'You designed {victim}’s latest exhibition. They took public credit for your work.',
+  'You manage {victim}’s accounts. They depend on your discretion but dismiss your advice.',
+  'You photographed {victim}’s rise to fame. Your old friendship has become a business arrangement.',
+  'You carry {victim}’s confidential deliveries. They once helped your family through a difficult winter.',
+  'You maintain {victim}’s equipment. They fund your experiments but demand impossible deadlines.',
+  'You are writing {victim}’s biography. They insist on approving every uncomfortable paragraph.'
+];
 const motives = [
   { conceal: 'stolen relief funds', document: 'audit', finding: 'diverted relief funds' },
   { conceal: 'the sale of confidential route maps', document: 'shipping receipt', finding: 'sold confidential route maps to a rival' },
@@ -61,28 +81,36 @@ export function buildCase(players, { seed = crypto.randomUUID(), previous = {} }
   const takeName = () => availableNames.splice(Math.floor(rng() * availableNames.length), 1)[0];
   const victim = takeName(), killerIndex = Math.floor(rng() * players.length), death = 20 * 60 + Math.floor(rng() * 45);
   const timeOfDeath = clock(death), before = clock(death - 12), discovery = clock(death + 7);
-  const characters = players.map((p, i) => ({ playerId: p.id, playerName: p.name, name: takeName(), role: roles[i], personality: 'Polite as a closed door; sharp when your reputation is at stake.', relationship: `You work with ${victim}, who controls your next contract.`, secret: secrets[i], alibi: `At ${timeOfDeath}, you were in the ${setting.publicArea}.`, alibiTime: timeOfDeath, killer: i === killerIndex, clues: [] }));
+  const characters = players.map((p, i) => ({ playerId: p.id, playerName: p.name, name: takeName(), role: roles[i], personality: personalities[i], relationship: relationships[i].replace('{victim}', victim), secret: secrets[i], alibi: `At ${timeOfDeath}, you were in the ${setting.publicArea}.`, alibiTime: timeOfDeath, killer: i === killerIndex, clues: [] }));
   const killer = characters[killerIndex], witnesses = characters.filter(c => !c.killer);
   Object.assign(killer, { secret: `You killed ${victim} in the ${setting.scene} at ${timeOfDeath} to conceal ${motive.conceal}.`, motive: `The victim discovered you ${motive.finding} and would report it tonight.`, method: method.name, tips: `Your public alibi is the ${setting.publicArea} at ${timeOfDeath}. Do not volunteer that you entered the ${setting.scene}. Deflect toward the other guests’ genuine secrets.` });
   let number = 0;
-  const add = (holder, subject, kind, clue, explanation) => { const c = { id: `C${++number}`, subjectId: subject.playerId, kind, text: clue, explanation }; holder.clues.push(c); return c; };
+  const add = (holder, subject, kind, clue, explanation) => { const c = { id: `C${++number}`, subjectId: subject.playerId, kind, unlockRound: kind === 'opportunity' ? 3 : kind === 'redHerring' ? 1 : 2, text: clue, explanation }; holder.clues.push(c); return c; };
   const methodClue = add(witnesses[0], killer, 'method', `${killer.name} signed out ${method.item} at ${before}. The return box is empty. The examiner’s public report records ${method.trace}.`, 'The borrowed object matches the physical cause of death; access alone is suspicion, not proof.');
   const opportunity = add(witnesses[1], killer, 'opportunity', `The entry recorder prints ${killer.name}’s personal badge entering the ${setting.scene} at ${timeOfDeath}; you saw them wearing that badge. They claimed to be in the ${setting.publicArea} then.`, 'The badge record and your sighting contradict the claimed alibi at the exact time of death. This is the missing opportunity, not just a motive.');
   for (let i = 0; i < characters.length; i++) {
     const holder = characters[i], other = characters[(i + 1) % characters.length];
     const distraction = distractions[i];
-    if (!holder.clues.length) add(holder, other, 'redHerring', `${other.name} ${distraction[0]} at ${before}. ${distraction[1]}`, `${distraction[2]} This explains the suspicious action, not the fatal object or the false alibi.`);
-    holder.shareableClueId = holder.clues[0].id;
+    const lead = add(holder, other, 'redHerring', `${other.name} ${distraction[0]} at ${before}. ${distraction[1]}`, `${distraction[2]} This explains the suspicious action, not the fatal object or the false alibi.`);
+    holder.shareableClueId = lead.id;
   }
   const motiveClue = add(witnesses[0], killer, 'motive', `${victim}’s signed ${motive.document} names ${killer.name} as the person who ${motive.finding}. A note on the document says it will be reported tonight.`, `The document supplies a specific motive: conceal ${motive.conceal}.`);
   for (let i = 0; i < characters.length; i++) {
     const holder = characters[i], other = characters[(i + 1) % characters.length];
-    if (holder.clues.length < 2) add(holder, other, 'redHerring', `${other.name}’s argument with ${victim} at ${before} concerned an unpaid contract. The written contract confirms payment was postponed, not cancelled.`, 'An argument is not a murder method. The contract explains the dispute without accounting for the physical evidence or the false alibi.');
+    if (holder.clues.length < 2) {
+      const distraction = distractions[(i + 3) % distractions.length];
+      const clue = add(holder, other, 'redHerring', `A follow-up on ${other.name}: a witness confirms they ${distraction[0]} at ${before}. ${distraction[1]}`, `${distraction[2]} This clears a side issue, not the contradiction in the final entry record.`);
+      clue.unlockRound = 3;
+    }
   }
-  const m = { seed, settingName: setting.name, era, genre, methodName: method.name, title: method.title, setting: `${setting.name}, ${era} · ${genre}`, victim, causeOfDeath: method.name, timeOfDeath, intro: `${setting.name}, ${era}. A fundraising preview ends with ${victim} found in the ${setting.scene} at ${discovery}. The examiner fixes death at ${timeOfDeath}: ${method.trace}. Everyone claims the ${setting.publicArea} as an alibi. Read your shareable clue aloud; one false alibi will not survive the clock.`, timeline: [{ time: before, event: 'Equipment loan and private disputes' }, { time: timeOfDeath, event: `Death in the ${setting.scene}` }, { time: discovery, event: 'Body discovered' }], characters, methodClueId: methodClue.id, catchClueId: opportunity.id, motiveClueId: motiveClue.id };
+  const m = { seed, settingName: setting.name, era, genre, methodName: method.name, title: method.title, setting: `${setting.name}, ${era} · ${genre}`, victim, causeOfDeath: method.name, timeOfDeath, intro: `${setting.name}, ${era}. A fundraising preview ends with ${victim} found in the ${setting.scene} at ${discovery}. The examiner fixes death at ${timeOfDeath}: ${method.trace}. Everyone claims the ${setting.publicArea} as an alibi. Introduce your character. Sealed records will open over three rounds; one false alibi will not survive the clock.`, timeline: [{ time: before, event: 'Equipment loan and private disputes' }, { time: timeOfDeath, event: `Death in the ${setting.scene}` }, { time: discovery, event: 'Body discovered' }], characters, methodClueId: methodClue.id, catchClueId: opportunity.id, motiveClueId: motiveClue.id };
   m.solutionClueIds = characters.flatMap(c => c.clues.map(clue => clue.id));
+  m.pacedEvidence = true;
   m.solution = caseSolution(m);
   return m;
+}
+export function evidenceAtRound(m, round) {
+  return m.characters.flatMap(c => c.clues.filter(clue => typeof clue === 'object' && (clue.unlockRound || 1) <= round).map(clue => ({ id: clue.id, text: clue.text, unlockRound: clue.unlockRound || 1, holder: c.name, playerName: c.playerName })));
 }
 export function caseSolution(m) {
   const killer = m.characters.find(c => c.killer), clues = m.characters.flatMap(c => c.clues);

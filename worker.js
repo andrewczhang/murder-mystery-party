@@ -1,6 +1,7 @@
 import page from './public/index.html';
 import { isMock, generateMystery, questions, reaction, withDeadline } from './ai.js';
 import { narrationChunks } from './public/narration.js';
+import { evidenceAtRound } from './cases.js';
 
 const reply = (data, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store' } });
 const fresh = () => ({ phase: 'lobby', players: [], round: 0, answers: {}, votes: {}, questions: [], revision: 0, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
@@ -67,13 +68,29 @@ export class Room {
     const r = this.room, m = r.mystery;
     const data = { code: r.code, phase: r.phase, round: r.round, busy: !!r.busy, preparationNotice: r.preparationNotice, source: m?.source, revision: r.revision, mock: isMock(this.env), players: r.players.map(p => ({ id: p.id, name: p.name, online: this.online(p.id) })), public: m && { title: m.title, setting: m.setting, victim: m.victim, causeOfDeath: m.causeOfDeath, timeOfDeath: m.timeOfDeath, intro: m.intro }, characters: m?.characters.map(c => ({ playerId: c.playerId, playerName: c.playerName, name: c.name, role: c.role })), questions: r.questions, answered: Object.keys(r.answers), reaction: r.reaction, votesCast: Object.keys(r.votes).length };
     data.characters?.forEach(c => { c.playerName ||= r.players.find(p => p.id === c.playerId)?.name; });
+    const evidenceRound = m?.pacedEvidence ? r.round : 3;
+    data.evidence = m ? evidenceAtRound(m, evidenceRound) : [];
     if (auth.playerId) { data.me = auth.playerId; const card = m?.characters.find(c => c.playerId === auth.playerId); data.role = card && { ...card, playerName: card.playerName || r.players.find(p => p.id === auth.playerId)?.name, shareableClueId: card.shareableClueId || 'L1', clues: card.clues.map((clue, i) => typeof clue === 'string' ? { id: `L${i + 1}`, text: clue } : { id: clue.id, text: clue.text }) }; data.myAnswer = r.answers[auth.playerId]; data.myVote = r.votes[auth.playerId]; }
+    if (data.role && m.pacedEvidence && m.characters.find(c => c.playerId === auth.playerId).clues.every(clue => typeof clue === 'object')) {
+      const card = m.characters.find(c => c.playerId === auth.playerId);
+      data.role.clues = card.clues.filter(clue => clue.unlockRound <= evidenceRound).map(({ id, text, unlockRound }) => ({ id, text, unlockRound }));
+      data.role.lockedClues = card.clues.length - data.role.clues.length;
+      data.role.shareableClueId = data.role.clues.find(clue => clue.unlockRound === r.round)?.id || data.role.clues.at(-1)?.id;
+    }
     if (r.phase === 'reveal') {
       const tally = Object.fromEntries(r.players.map(p => [p.id, Object.values(r.votes).filter(id => id === p.id).length]));
       const killer = m.characters.find(c => c.killer);
       const killerWins = tally[killer.playerId] <= r.players.length / 2;
       const voteStory = `The table gave ${killer.name} ${tally[killer.playerId]} of ${r.players.length} votes. ${killerWins ? 'Without an absolute majority, the killer walks free.' : 'An absolute majority saw through the alibi. The guests caught the killer.'} ${m.characters.filter(c => tally[c.playerId] && !c.killer).map(c => `${tally[c.playerId]} voted for ${c.name}; their suspicious behaviour was not the proof of this murder.`).join(' ')}`;
-      data.reveal = { killer: killer.name, killerId: killer.playerId, solution: `${m.solution}\n\n${voteStory}`, tally, killerWins };
+      data.reveal = { killer: killer.name, killerId: killer.playerId, tally, killerWins, caseFileOpen: !!r.caseFileOpen };
+      if (r.caseFileOpen) {
+        data.reveal.why = m.catchClueId ? `${killer.name}’s equipment loan (${m.methodClueId}) matches the method. The entry record (${m.catchClueId}) contradicts the ${m.timeOfDeath} alibi; ${m.motiveClueId} supplies the motive.` : 'The host has opened the case file. Read the explanation on the shared screen.';
+        if (auth.host) data.reveal.solution = `${m.solution}\n\n${voteStory}`;
+        else data.reveal.details = (m.solutionClueIds || []).flatMap(id => {
+          const clue = m.characters.flatMap(c => c.clues).find(clue => clue.id === id);
+          return clue ? [{ id, text: clue.text, explanation: clue.explanation }] : [];
+        });
+      }
     }
     return data;
   }
@@ -147,6 +164,9 @@ export class Room {
         r.busy = true; r.preparationNotice = ''; await this.save();
         try { await this.advance(); r.revision++; }
         finally { r.busy = false; await this.save(); await this.presence(); }
+      } else if (data.type === 'open-solution') {
+        if (!auth.host || r.phase !== 'reveal' || r.busy) throw new Error('Only the host can open the case file after voting.');
+        r.caseFileOpen = true; await this.save();
       } else if (data.type === 'answer') {
         if (!auth.playerId || r.phase !== 'questions' || r.busy || !r.questions.some(q => q.playerId === auth.playerId)) throw new Error('No question for you right now.');
         if (typeof data.text !== 'string' || !data.text.trim() || data.text.length > 600) throw new Error('Answer in 1–600 characters.');
@@ -162,20 +182,22 @@ export class Room {
     const r = this.room;
     if (r.phase === 'lobby') {
       if (r.players.length < 3) throw new Error('You need 3–8 players.');
-      r.mystery = await generateMystery(this.env, r.players.map(({ id, name }) => ({ id, name })), { previous: r.previousCase }); r.phase = 'intro';
+      r.mystery = await generateMystery(this.env, r.players.map(({ id, name }) => ({ id, name })), { previous: r.previousCase }); r.shownClueIds = []; r.caseFileOpen = false; r.phase = 'intro';
     } else if (r.phase === 'intro' || (r.phase === 'reaction' && r.round < 3)) {
       const qs = await questions(this.env, r.mystery, r.round + 1);
       r.round++; r.questions = qs; r.answers = {}; r.phase = 'questions';
+      r.shownClueIds = evidenceAtRound(r.mystery, r.round).map(clue => clue.id);
     } else if (r.phase === 'questions') {
       if (r.questions.some(q => !r.answers[q.playerId])) throw new Error('Wait for the questioned players to submit answers.');
       r.reaction = await reaction(this.env, r.mystery, r.answers, r.round); r.phase = 'reaction';
     } else if (r.phase === 'reaction') { r.phase = 'voting'; r.questions = []; }
     else if (r.phase === 'voting') {
       if (Object.keys(r.votes).length !== r.players.length) throw new Error('Wait for every vote.');
+      if (r.mystery.pacedEvidence && r.mystery.solutionClueIds.some(id => !r.shownClueIds?.includes(id))) throw new Error('The case evidence must be shown before the reveal.');
       r.phase = 'reveal';
     } else if (r.phase === 'reveal') {
       const { settingName, era, genre, methodName } = r.mystery;
-      Object.assign(r, { phase: 'lobby', previousCase: { settingName, era, genre, methodName }, mystery: undefined, round: 0, questions: [], answers: {}, votes: {}, reaction: '' });
+      Object.assign(r, { phase: 'lobby', previousCase: { settingName, era, genre, methodName }, mystery: undefined, round: 0, questions: [], answers: {}, votes: {}, reaction: '', caseFileOpen: false });
     }
   }
   async tts(request) {

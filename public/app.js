@@ -9,8 +9,9 @@ const store = {
   remove(key) { try { localStorage.removeItem(key); } catch { /* Storage may be disabled. */ } },
   set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { toast('Storage is unavailable. Keep this tab open to retain your role.'); } }
 };
-let session, ws, state, joinMode = location.pathname === '/join', sound = true, speechKey = '', revealed = false, reconnectTimer, heartbeatTimer, heartbeatPending = false, toastTimer, audio, audioUrl, voiceGeneration = 0, draft = '', draftRound = 0, currentUtterance, cancelPlayback, voiceStatus = '', serverVoiceFailed = false;
+let session, ws, state, joinMode = location.pathname === '/join', sound = true, speechKey = '', reconnectTimer, heartbeatTimer, heartbeatPending = false, toastTimer, audio, audioUrl, voiceGeneration = 0, draft = '', draftRound = 0, currentUtterance, cancelPlayback, voiceStatus = '', serverVoiceFailed = false;
 const pending = new Map();
+let voiceUnavailable = false;
 let sequence = 0;
 function toast(message) { const box = document.querySelector('#toast'); box.textContent = message; box.classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => box.classList.remove('visible'), 6500); }
 function request(type, data = {}) {
@@ -70,7 +71,6 @@ function connect() {
       const sceneChanged = state?.phase !== message.state.phase || state?.round !== message.state.round;
       state = message.state;
       if (draftRound !== state.round) { draftRound = state.round; draft = ''; }
-      if (state.phase === 'lobby') revealed = false;
       render(); if (sceneChanged) window.scrollTo(0, 0); autoNarrate();
     }
   });
@@ -98,7 +98,7 @@ function narration() {
   if (state.phase === 'intro') return state.public.intro;
   if (state.phase === 'questions') return state.questions.map(q => q.text).join(' ');
   if (state.phase === 'reaction') return state.reaction;
-  if (state.phase === 'reveal' && (revealed || !session.host)) return state.reveal.solution;
+  if (state.phase === 'reveal' && state.reveal.caseFileOpen) return session.host ? state.reveal.solution : `${state.reveal.killer}. ${state.reveal.why}`;
   return '';
 }
 function setVoiceStatus(message) { voiceStatus = message; const label = document.querySelector('#voice-status'); if (label) label.textContent = message; }
@@ -146,11 +146,17 @@ async function speak(text) {
       await browserVoice(chunk, generation);
     }
     if (generation === voiceGeneration) setVoiceStatus('Narration finished');
-  } catch { if (generation === voiceGeneration) setVoiceStatus('This device could not play its voice. Read along below, or try another browser with a speech voice installed.'); }
+  } catch {
+    if (generation === voiceGeneration) {
+      voiceUnavailable = true; sound = false; stopVoice();
+      setVoiceStatus('Text-only mode · Speech is unavailable on this device. All scenes are printed below; the host can read aloud.');
+      render();
+    }
+  }
 }
 function autoNarrate() {
   if (!session?.host || !state) return;
-  const key = `${state.phase}-${state.round}-${revealed}`;
+  const key = `${state.phase}-${state.round}-${state.reveal?.caseFileOpen}`;
   if (key === speechKey) return; speechKey = key;
   speak(narration());
 }
@@ -158,7 +164,18 @@ const detective = () => '<div class="detective"><span class="detective-icon">M</
 function playerList() { return `<ul class="players">${state.players.map((p, i) => `<li><span class="avatar">${String(i + 1).padStart(2, '0')}</span><span>${esc(p.name)}</span><span class="small ${p.online ? 'dot' : ''}">${p.online ? '● Ready' : '○ Offline'}</span></li>`).join('') || '<li class="small">The guest list is waiting for its first suspect.</li>'}</ul>`; }
 const classicNote = () => state.source === 'classic' ? '<p class="status small" role="status">Classic case · The AI writer is unavailable. Your complete, evidence-checked case is ready to play. No retry needed.</p>' : '';
 const progress = () => state.busy ? '<div class="status writing" role="status"><p class="eyebrow">THE DETECTIVE IS WRITING THE CASE…</p><p>Usually ready within 25 seconds. A classic case is standing by if the AI is unavailable.</p><p class="small">While you wait: choose a character voice. Read your clue aloud when it arrives, but keep your secret private.</p></div>' : state.preparationNotice ? `<p class="status" role="status">${esc(state.preparationNotice)}</p>` : '';
-const voiceControls = () => `<p id="voice-status" class="small" role="status">${esc(voiceStatus)}</p>`;
+const voiceControls = () => `<div class="voice-options"><button class="back" id="mute" aria-pressed="${sound}" ${voiceUnavailable ? 'disabled' : ''}>${voiceUnavailable ? '🔇 Voice unavailable' : sound ? '🔊 Narration on' : '🔇 Narration off'}</button>${voiceUnavailable ? '' : `<button class="back" id="hear" ${sound ? '' : 'disabled'}>Replay narration</button>`}</div><p id="voice-status" class="small" role="status">${esc(voiceStatus)}</p>`;
+function evidenceBoard() {
+  const clues = state.evidence || [], fresh = clues.filter(clue => clue.unlockRound === state.round), earlier = clues.filter(clue => clue.unlockRound < state.round);
+  const list = items => items.map(clue => `<div class="evidence-item"><span class="label gold">${esc(clue.id)} · ${esc(clue.holder)} <span class="small">(${esc(clue.playerName)})</span></span><p>${esc(clue.text)}</p></div>`).join('');
+  if (!clues.length) return '';
+  return `<section class="status evidence"><p class="eyebrow">NEW EVIDENCE · ROUND ${state.round}</p><p class="small">Read these newly opened records aloud before answering. Everyone can compare them.</p>${list(fresh)}${earlier.length ? `<details><summary>Review ${earlier.length} earlier clues</summary>${list(earlier)}</details>` : ''}</section>`;
+}
+const theoryKey = () => `dn-theory-${state.code}-${state.me}-${state.public.title}-${state.public.victim}-${state.public.timeOfDeath}-${state.round}`;
+function sideInvestigation() {
+  const clues = state.role.clues.filter(clue => clue.unlockRound === state.round);
+  return `<section class="panel"><p class="eyebrow">YOUR SIDE OF THE INVESTIGATION</p><h3>Who do you suspect now?</h3><p>${clues.length ? `Read your newly unlocked clue${clues.length > 1 ? 's' : ''} aloud, then compare the new evidence.` : 'Compare the new evidence on the shared screen with your earlier clues. What has changed?'}</p>${clues.map(c => `<p><strong>${esc(c.id)}</strong> · ${esc(c.text)}</p>`).join('')}<label for="theory">Private suspect note · Round ${state.round}</label><textarea id="theory" maxlength="300" placeholder="Who, why, and what could change your mind?">${esc(store.get(theoryKey()) || '')}</textarea><p class="small">Saved only on this phone. Not sent to the host or other guests. Share your theory aloud when ready; this does not delay the round.</p></section>`;
+}
 function landing() {
   return `<div class="hero fade"><section><p class="eyebrow">AN AI MURDER MYSTERY PARTY</p><h1>A perfect night.<br>A <em>perfect crime.</em></h1><p class="lead">Gather your friends. Step into character. Uncover a killer hiding in plain sight.</p><p class="lead">One of you did it. All of you have secrets.</p><div class="actions"><button class="btn" id="host">Host a game <span aria-hidden="true">↗</span></button><button class="btn secondary" id="show-join">Join a room</button></div><p class="small">No downloads. No scripts. Just a very good alibi.</p><div class="meta"><span>3–8 PLAYERS</span><span>20–40 MINUTES</span><span>ONE SHARED SCREEN</span></div></section><div class="scene" aria-label="A moonlit manor in the rain"><span class="scene-stamp">THE NIGHT IS YOUNG. SOMEONE ISN’T.</span><div class="moon"></div><div class="manor"></div><div class="windows"></div><span class="case-tag">CASE FILE / 001</span><div class="scene-line"><span>BLACKTHORN MANOR</span><span>11:45 PM</span></div></div></div><section class="how"><div><strong><span>01</span>Assemble the suspects</strong><p>Put the host screen on a TV. Everyone joins on their phone.</p></div><div><strong><span>02</span>Keep your secrets close</strong><p>A fresh case. A private character. A detective asking questions.</p></div><div><strong><span>03</span>Make your accusation</strong><p>Trade clues, expose the lies, and cast your vote. Choose wisely.</p></div></section>`;
 }
@@ -174,15 +191,17 @@ function roleCard() {
   const c = state.role;
   if (!c) return '';
   const shareable = c.clues.find(clue => clue.id === c.shareableClueId);
-  return `<section class="panel"><div class="role-head"><span class="secret-label">PRIVATE DOSSIER · FOR YOUR EYES ONLY</span><h2>${esc(c.name)}</h2><p class="small">Played by ${esc(c.playerName)} · ${esc(c.role)}</p><span class="badge ${c.killer ? 'killer' : ''}">${c.killer ? 'YOU ARE THE KILLER' : esc(c.role)}</span></div><div class="status"><h3>Read this aloud · ${esc(shareable.id)}</h3><p>${esc(shareable.text)}</p><p class="small">This clue matters in the final explanation. Share it with the table.</p></div>${[['Your character', c.personality], ['Connection to the victim', c.relationship], ['Your secret', c.secret], ['Your alibi', c.alibi], ...(c.killer ? [['Your motive', c.motive], ['Your method', c.method], ['Keep your cover', c.tips]] : [])].map(([title, text]) => `<div class="role-section"><h3>${title}</h3><p>${esc(text)}</p></div>`).join('')}<div class="role-section"><h3>Your other evidence</h3><ul>${c.clues.filter(clue => clue.id !== c.shareableClueId).map(clue => `<li><strong>${esc(clue.id)}</strong> · ${esc(clue.text)}</li>`).join('')}</ul></div></section>`;
+  return `<section class="panel"><div class="role-head"><span class="secret-label">PRIVATE DOSSIER · FOR YOUR EYES ONLY</span><h2>${esc(c.name)}</h2><p class="small">Played by ${esc(c.playerName)} · ${esc(c.role)}</p><span class="badge ${c.killer ? 'killer' : ''}">${c.killer ? 'YOU ARE THE KILLER' : esc(c.role)}</span></div><div class="status">${shareable ? `<h3>Read this aloud · ${esc(shareable.id)}</h3><p>${esc(shareable.text)}</p><p class="small">This clue matters in the final explanation. Share it with the table.</p>` : '<p>Your first clue opens in Round 1. For now, introduce your character and keep your secret private.</p>'}${c.lockedClues ? `<p class="small">${c.lockedClues} sealed record${c.lockedClues > 1 ? 's' : ''} will open in later rounds.</p>` : ''}</div>${[['Your character', c.personality], ['Connection to the victim', c.relationship], ['Your secret', c.secret], ['Your alibi', c.alibi], ...(c.killer ? [['Your motive', c.motive], ['Your method', c.method], ['Keep your cover', c.tips]] : [])].map(([title, text]) => `<div class="role-section"><h3>${title}</h3><p>${esc(text)}</p></div>`).join('')}<div class="role-section"><h3>Your other evidence</h3><ul>${c.clues.filter(clue => clue.id !== c.shareableClueId).map(clue => `<li><strong>${esc(clue.id)}</strong> · ${esc(clue.text)}</li>`).join('')}</ul></div></section>`;
 }
 function playerGame() {
   let action = '';
   const q = state.questions.find(q => q.playerId === state.me);
-  if (state.phase === 'questions' && q) action = `<section class="panel"><p class="eyebrow">THE DETECTIVE IS ASKING YOU…</p><p class="question">“${esc(q.text)}”</p><p class="small">Answer out loud, then leave a short statement below.</p><form id="answer-form"><label for="answer">Your statement</label><textarea id="answer" maxlength="600" required placeholder="I can explain…">${esc(draft || state.myAnswer || '')}</textarea><div class="actions"><button class="btn">${state.myAnswer ? 'Update answer' : 'Submit answer'}</button><button class="btn secondary" type="button" id="dictate">Dictate</button></div></form>${state.myAnswer ? '<span class="small dot">✓ Statement received. You may edit it until the host continues.</span>' : ''}</section>`;
+  const statement = draft || state.myAnswer || '';
+  if (state.phase === 'questions' && q) action = `<section class="panel"><p class="eyebrow">THE DETECTIVE IS ASKING YOU…</p><p class="question">“${esc(q.text)}”</p><p class="small">Answer out loud, then leave a short statement below.</p><form id="answer-form"><label for="answer">Your statement</label><textarea id="answer" maxlength="600" aria-describedby="answer-counter answer-limit" required placeholder="I can explain…">${esc(statement)}</textarea><p id="answer-counter" class="small">${statement.length}/600 characters${statement.length >= 600 ? ' · Limit reached' : ''}</p><p id="answer-limit" class="small" role="status">Maximum 600 characters. Oversized pastes are not inserted; shorten them first.</p><div class="actions"><button class="btn">${state.myAnswer ? 'Update answer' : 'Submit answer'}</button><button class="btn secondary" type="button" id="dictate">Dictate</button></div></form>${state.myAnswer ? '<span class="small dot">✓ Statement received. You may edit it until the host continues.</span>' : ''}</section>`;
   else if (state.phase === 'voting') action = `<section class="panel"><p class="eyebrow">MAKE YOUR ACCUSATION</p><h3>Who killed ${esc(state.public.victim)}?</h3><p class="small">No voting for yourself. You can change your vote until the host reveals the case.</p><div class="vote-grid">${state.characters.filter(c => c.playerId !== state.me).map(c => `<button class="vote ${state.myVote === c.playerId ? 'selected' : ''}" data-vote="${esc(c.playerId)}"><strong>${esc(c.name)}</strong><span>${esc(c.role)} ${state.myVote === c.playerId ? '· ✓ Your vote' : ''}</span></button>`).join('')}</div><p class="small">${state.votesCast} of ${state.players.length} votes cast.</p></section>`;
   else action = `<div class="status">${state.phase === 'intro' ? 'The scene is set. Read your role in private, then listen to the host screen.' : state.phase === 'questions' ? 'The detective is questioning other guests. Listen carefully. Your moment may be next.' : 'Listen to Detective Marlowe. Discuss the evidence with your fellow suspects.'}</div>`;
-  return `<div class="section-head"><p class="eyebrow" style="margin:0">${esc(state.public.title)}</p><span class="badge">${state.round ? `Round ${state.round}/3` : 'Your role'}</span></div>${classicNote()}<div class="grid"><div>${action}<button id="hear" class="btn secondary">Read the public scene aloud</button>${voiceControls()}</div><div>${roleCard()}</div></div>`;
+  if ((state.phase === 'questions' && !q) || state.phase === 'reaction') action = sideInvestigation();
+  return `<div class="section-head"><p class="eyebrow" style="margin:0">${esc(state.public.title)}</p><span class="badge">${state.round ? `Round ${state.round}/3` : 'Your role'}</span></div>${classicNote()}${voiceControls()}<div class="grid"><div>${action}${state.evidence?.length ? `<details class="shared-evidence"><summary>Open shared evidence · Round ${state.round}</summary>${evidenceBoard()}</details>` : ''}</div><div>${roleCard()}</div></div>`;
 }
 function hostGame() {
   let body = '';
@@ -192,21 +211,40 @@ function hostGame() {
   if (state.phase === 'reaction') body = `${detective()}<p class="eyebrow">MARLOWE’S OBSERVATIONS</p><p class="story">“${esc(state.reaction)}”</p><div class="status">Take a moment to compare clues. Someone’s story doesn’t add up.</div>`;
   if (state.phase === 'voting') body = `<p class="eyebrow">THE FINAL ACCUSATION</p><h2>One killer.<br>No more hiding.</h2><p class="lead">Cast your vote on your phone. The killer is caught only if more than half of all players vote for them.</p><div class="panel"><h3>${state.votesCast} of ${state.players.length} votes cast</h3><div class="progress"><i style="width:${state.votesCast / state.players.length * 100}%"></i></div><p class="small">Votes stay secret until the reveal. A tie or split vote lets the killer escape.</p></div>`;
   const blocked = state.busy || (state.phase === 'questions' && state.answered.length < state.questions.length) || (state.phase === 'voting' && state.votesCast < state.players.length);
-  const label = { intro: 'Begin questioning', questions: 'Hear the detective', reaction: state.round < 3 ? 'Next round' : 'Open the vote', voting: 'Reveal the truth' }[state.phase];
-  return `<div class="section-head"><span class="stage-label">ROOM ${esc(state.code)} / ${state.round ? `ROUND ${state.round} OF 3` : 'ACT I · THE ARRIVAL'}</span><span class="badge">${state.source === 'ai' ? 'AI-edited case' : 'Classic case'}</span></div>${classicNote()}<section class="panel">${body}</section><div class="controls"><div class="actions"><button class="btn secondary" id="hear">Hear again</button><button class="btn secondary" id="mute">${sound ? 'Sound on' : 'Sound off'}</button></div><button class="btn" id="next" ${blocked ? 'disabled' : ''}>${state.busy ? 'The detective is thinking…' : `${label} ↗`}</button></div>${voiceControls()}`;
+  const label = { intro: 'Next: the detective’s questions', questions: 'Next: the detective’s observations', reaction: state.round < 3 ? 'Next round: new evidence' : 'Open the vote', voting: 'Reveal the truth' }[state.phase];
+  return `<div class="section-head"><span class="stage-label">ROOM ${esc(state.code)} / ${state.round ? `ROUND ${state.round} OF 3` : 'ACT I · THE ARRIVAL'}</span><span class="badge">${state.source === 'ai' ? 'AI-edited case' : 'Classic case'}</span></div>${classicNote()}${voiceControls()}${evidenceBoard()}<section class="panel">${body}</section><div class="controls"><button class="btn" id="next" ${blocked ? 'disabled' : ''}>${state.busy ? 'The detective is thinking…' : `${label} ↗`}</button></div>`;
 }
 function reveal() {
   const r = state.reveal;
-  return `<section class="narrow fade" style="max-width:860px"><p class="eyebrow">THE VERDICT IS IN</p><h2>${r.killerWins ? 'The killer walks free.' : 'The mask comes off.'}</h2><div class="panel"><p class="label gold">THE TABLE’S ACCUSATIONS</p>${state.characters.map(c => `<div class="tally"><span class="tally-name">${esc(c.name)}<br><small>${esc(c.playerName)}</small></span><span class="bar"><i style="width:${r.tally[c.playerId] / state.players.length * 100}%"></i></span><span>${r.tally[c.playerId]}</span></div>`).join('')}<div class="rule"></div><p class="eyebrow">THE KILLER WAS</p><h2>${esc(r.killer)}</h2><span class="badge ${r.killerWins ? 'killer' : ''}">${r.killerWins ? 'Killer wins · No absolute majority' : 'Guests win · Killer caught'}</span>${revealed || !session.host ? `<div class="rule"></div>${r.solution.split('\n\n').map(paragraph => `<p class="story" style="font-size:22px">${esc(paragraph)}</p>`).join('')}` : '<div class="actions"><button class="btn" id="solution">Open the case file & narrate ↗</button></div>'}</div>${session.host ? '<div class="controls"><div class="actions"><button class="btn secondary" id="hear">Hear again</button><button class="btn secondary" id="mute">' + (sound ? 'Sound on' : 'Sound off') + '</button></div><button class="btn" id="next">Play again · Same guests ↗</button></div>' : '<button class="btn secondary" id="hear">Read the reveal aloud</button><p class="small" style="margin-top:20px">Stay here. Your host can start a new mystery with the same guests.</p>'}${voiceControls()}</section>`;
+  const tally = state.characters.map(c => `<div class="tally"><span class="tally-name">${esc(c.name)}<br><small>${esc(c.playerName)}</small></span><span class="bar"><i style="width:${r.tally[c.playerId] / state.players.length * 100}%"></i></span><span>${r.tally[c.playerId]}</span></div>`).join('');
+  const verdict = `<span class="badge ${r.killerWins ? 'killer' : ''}">${r.killerWins ? 'Killer wins · No absolute majority' : 'Guests win · Killer caught'}</span>`;
+  if (!session.host) return `<section class="narrow fade"><p class="eyebrow">THE VERDICT IS IN</p><h2>${esc(r.killer)}</h2>${verdict}${voiceControls()}${r.caseFileOpen ? `<div class="status"><h3>Why this suspect?</h3><p>${esc(r.why)}</p></div><details><summary>How the clues fit</summary>${(r.details || []).map(c => `<div class="evidence-item"><strong>${esc(c.id)}</strong><p>${esc(c.text)}</p><p>${esc(c.explanation)}</p></div>`).join('')}</details>` : '<div class="status">The host will open the case file shortly. Look up for the explanation.</div>'}<details class="shared-evidence"><summary>See the vote tally</summary>${tally}</details><p class="small" style="margin-top:20px">The full narrative is on the shared screen. Stay here for another mystery with the same guests.</p></section>`;
+  return `<section class="narrow fade" style="max-width:860px"><p class="eyebrow">THE VERDICT IS IN</p><h2>${r.killerWins ? 'The killer walks free.' : 'The mask comes off.'}</h2>${voiceControls()}<div class="panel"><p class="label gold">THE TABLE’S ACCUSATIONS</p>${tally}<div class="rule"></div><p class="eyebrow">THE KILLER WAS</p><h2>${esc(r.killer)}</h2>${verdict}${r.caseFileOpen ? `<div class="rule"></div>${r.solution.split('\n\n').map(paragraph => `<p class="story" style="font-size:22px">${esc(paragraph)}</p>`).join('')}` : '<div class="actions"><button class="btn" id="solution">Open the case file ↗</button></div>'}</div><div class="controls"><button class="btn" id="next">Play again · Same guests ↗</button></div></section>`;
 }
 function render() {
   const focused = document.activeElement?.id;
-  const cursor = focused === 'answer' ? document.activeElement.selectionStart : null;
+  const editing = ['answer', 'theory'].includes(focused);
+  const cursor = editing ? document.activeElement.selectionStart : null;
   app.innerHTML = !state ? (session ? '<section class="narrow"><p class="eyebrow">OPENING THE CASE FILE</p><h2>Just a moment…</h2></section>' : joinMode ? joinForm() : landing()) : state.phase === 'lobby' ? lobby() : state.phase === 'reveal' ? reveal() : session.host ? hostGame() : playerGame();
-  if (focused === 'answer') { const input = document.querySelector('#answer'); input?.focus(); input?.setSelectionRange(cursor, cursor); }
+  if (editing) { const input = document.getElementById(focused); input?.focus(); input?.setSelectionRange(cursor, cursor); }
   if (state?.phase === 'lobby' && session.host) QRCode.toDataURL(`${location.origin}/join?code=${state.code}`, { margin: 1, width: 256 }).then(url => { const img = document.querySelector('#qr'); if (img) img.src = url; }).catch(() => {});
 }
-app.addEventListener('input', event => { if (event.target.id === 'answer') draft = event.target.value; });
+app.addEventListener('input', event => {
+  if (event.target.id === 'answer') {
+    draft = event.target.value;
+    document.querySelector('#answer-counter').textContent = `${draft.length}/600 characters${draft.length >= 600 ? ' · Limit reached' : ''}`;
+  }
+  if (event.target.id === 'theory') store.set(theoryKey(), event.target.value);
+});
+app.addEventListener('paste', event => {
+  const field = event.target;
+  if (field.id !== 'answer' || !event.clipboardData) return;
+  const pasted = event.clipboardData.getData('text');
+  if (field.value.length - (field.selectionEnd - field.selectionStart) + pasted.length > 600) {
+    event.preventDefault();
+    document.querySelector('#answer-limit').textContent = 'Paste not inserted: your statement would exceed 600 characters. Shorten the text and paste again. Your existing draft is unchanged.';
+  }
+});
 app.addEventListener('submit', async event => {
   event.preventDefault();
   const button = event.target.querySelector('button'); button.disabled = true;
@@ -232,14 +270,19 @@ app.addEventListener('click', async event => {
     else if (button.id === 'next') { stopVoice(); await request('next', { revision: state.revision }); }
     else if (button.id === 'copy') { await navigator.clipboard.writeText(`${location.origin}/join?code=${state.code}`); toast('Invitation link copied.'); }
     else if (button.id === 'hear') speak(narration());
-    else if (button.id === 'mute') { sound = !sound; if (!sound) stopVoice(); else speak(narration()); render(); }
-    else if (button.id === 'solution') { revealed = true; render(); autoNarrate(); }
+    else if (button.id === 'mute') { sound = !sound; if (!sound) { stopVoice(); setVoiceStatus('Text-only mode · Narration is off. All scenes remain readable.'); } else speak(narration()); render(); }
+    else if (button.id === 'solution') await request('open-solution');
     else if (button.dataset.vote) await request('vote', { playerId: button.dataset.vote });
     else if (button.id === 'dictate') {
       const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       if (!Recognition) return toast('Dictation isn’t supported here. Use your keyboard’s microphone or type your answer.');
       const recognition = new Recognition(); recognition.lang = 'en-US';
-      recognition.onresult = e => { draft = e.results[0][0].transcript.slice(0, 600); const field = document.querySelector('#answer'); if (field) field.value = draft; };
+      recognition.onresult = e => {
+        const transcript = e.results[0][0].transcript;
+        if (transcript.length > 600) { const hint = document.querySelector('#answer-limit'); if (hint) hint.textContent = 'Dictation exceeds 600 characters. Try a shorter statement. Your existing draft is unchanged.'; return; }
+        draft = transcript; const field = document.querySelector('#answer');
+        if (field) { field.value = draft; document.querySelector('#answer-counter').textContent = `${draft.length}/600 characters${draft.length === 600 ? ' · Limit reached' : ''}`; }
+      };
       recognition.onerror = () => toast('Microphone unavailable. Please type your statement.'); recognition.start();
     }
   } catch (e) { toast(e.message); } finally { if (button.id === 'host') button.disabled = false; }

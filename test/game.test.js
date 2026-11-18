@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateMystery, generateMystery, questions, reaction, isMock, withDeadline } from '../ai.js';
-import { buildCase, banned } from '../cases.js';
+import { validateMystery, generateMystery, questions, reaction, quoteExcerpt, isMock, withDeadline } from '../ai.js';
+import { buildCase, banned, evidenceAtRound } from '../cases.js';
 import { narrationChunks } from '../public/narration.js';
 import { Room } from '../dist/worker.js';
 
@@ -16,13 +16,16 @@ test('seeded classic cases cover 3–8 guests, varied worlds and grounded sharea
     assert.equal(banned.test(JSON.stringify(m)), false);
     assert.equal(m.characters.filter(c => c.killer).length, 1);
     assert.equal(m.characters.length, n);
+    assert.equal(new Set(m.characters.map(c => c.personality)).size, n);
+    assert.equal(new Set(m.characters.map(c => c.relationship)).size, n);
+    assert.ok(m.characters.every(c => c.relationship.includes(m.victim)));
     for (const c of m.characters) {
       assert.equal(c.playerName, p.find(p => p.id === c.playerId).name);
       assert.ok(!p.some(p => p.name === c.name)); assert.notEqual(c.secret, 'None');
       assert.ok(m.solutionClueIds.includes(c.shareableClueId));
       assert.ok(c.clues.every(clue => clue.subjectId !== c.playerId));
     }
-    assert.equal(new Set(m.solutionClueIds).size, n * 2);
+    assert.equal(new Set(m.solutionClueIds).size, n * 2 + 1);
     assert.match(m.solution, /moment to catch/);
   }
   assert.deepEqual([settings.size, eras.size, genres.size, methods.size], [6, 5, 5, 5]);
@@ -42,7 +45,9 @@ test('validator rejects invalid coverage, timelines, self-clues, unprinted evide
     m => { m.characters[0].alibiTime = '00:00'; },
     m => { m.characters[0].clues[0].subjectId = m.characters[0].playerId; },
     m => { m.solutionClueIds.push('C999'); }, m => { m.solution += ' An unseen fingerprint proves it.'; },
-    m => { m.methodClueId = m.catchClueId; }, m => { m.title = 'Blackstone Manor'; }
+    m => { m.methodClueId = m.catchClueId; }, m => { m.title = 'Blackstone Manor'; },
+    m => { m.characters.flatMap(c => c.clues).find(c => c.id === m.catchClueId).unlockRound = 1; },
+    m => { m.characters[0].clues[0].unlockRound = 4; }
   ]) { const m = fixture(); change(m); assert.throws(() => validateMystery(m, players)); }
 });
 test('one small json_schema call edits the case, repairs invalid citations, and ignores extra properties', async () => {
@@ -67,14 +72,14 @@ test('quota 4006/429, malformed output, bad edits and any AI error fall back imm
   const m = await generateMystery({ AI: { run: async () => ({ errors: [{ code: 4006, message: 'quota' }] }) } }, players);
   assert.equal(m.quotaLimited, true);
 });
-test('questions are balanced, nonrepeating and reference only the addressee’s printed shareable clue', async () => {
+test('questions are balanced, nonrepeating and reference only the addressee’s unlocked clue', async () => {
   const env = { AI: { run: () => { throw new Error('Detective must not call AI'); } } };
   for (let n = 3; n <= 8; n++) {
     const m = fixture(people(n)), counts = Object.fromEntries(m.characters.map(c => [c.playerId, 0])), lines = [];
     for (let round = 1; round <= 3; round++) {
       const qs = await questions(env, m, round); assert.equal(qs.length, 3);
       assert.equal(new Set(qs.map(q => q.playerId)).size, 3);
-      for (const q of qs) { counts[q.playerId]++; const c = m.characters.find(c => c.playerId === q.playerId); assert.ok(q.text.includes(c.shareableClueId)); assert.ok(!q.text.includes(c.secret)); lines.push(q.text); }
+      for (const q of qs) { counts[q.playerId]++; const c = m.characters.find(c => c.playerId === q.playerId); assert.ok(c.clues.some(clue => clue.unlockRound <= round && q.text.includes(clue.id))); assert.ok(!q.text.includes(c.secret)); lines.push(q.text); }
     }
     assert.equal(new Set(lines).size, 9);
     assert.ok(Math.max(...Object.values(counts)) - Math.min(...Object.values(counts)) <= 1);
@@ -86,6 +91,35 @@ test('reactions quote actual answers, distinguish rounds, handle empty input and
   const lines = await Promise.all([1, 2, 3].map(round => reaction(env, m, { p0: 'I checked the entry recorder.' }, round)));
   assert.equal(new Set(lines).size, 3); lines.forEach(line => assert.ok(line.includes('I checked the entry recorder.')));
   assert.match(await reaction(env, m, {}), /No statements/);
+});
+test('quote excerpts keep complete short answers and mark word-boundary omissions', async () => {
+  assert.equal(quoteExcerpt('I checked it out.'), 'I checked it out.');
+  assert.equal(quoteExcerpt(''), ''); assert.equal(quoteExcerpt(null), '');
+  assert.equal(quoteExcerpt('A complete phrase', 17), 'A complete phrase');
+  assert.equal(quoteExcerpt('I checked it out yesterday.', 16), 'I checked it…');
+  assert.equal(quoteExcerpt('indivisibleword', 6), '…');
+  const answer = 'I checked it out. '.repeat(30), excerpt = quoteExcerpt(answer);
+  assert.ok(excerpt.length <= 180); assert.ok(excerpt.endsWith('…'));
+  assert.ok(answer.startsWith(excerpt.slice(0, -1)));
+  const next = answer[excerpt.length - 1]; assert.match(next, /\s/);
+  assert.ok((await reaction({}, fixture(), { p0: answer })).includes(`“${excerpt}”`));
+});
+test('evidence escalates from ambiguous leads to method/motive then the decisive alibi record', () => {
+  for (let n = 3; n <= 8; n++) for (let seed = 0; seed < 20; seed++) {
+    const m = buildCase(people(n), { seed: String(seed) }), all = m.characters.flatMap(c => c.clues);
+    assert.deepEqual(evidenceAtRound(m, 0), []);
+    for (let round = 1; round <= 3; round++) {
+      const evidence = evidenceAtRound(m, round), fresh = evidence.filter(c => c.unlockRound === round);
+      assert.ok(fresh.length > 0);
+      assert.ok(evidence.every(c => c.explanation === undefined && c.kind === undefined));
+    }
+    assert.ok(evidenceAtRound(m, 1).every(c => all.find(clue => clue.id === c.id).kind === 'redHerring'));
+    assert.ok(evidenceAtRound(m, 2).some(c => c.id === m.methodClueId));
+    assert.ok(evidenceAtRound(m, 2).some(c => c.id === m.motiveClueId));
+    assert.ok(!evidenceAtRound(m, 2).some(c => c.id === m.catchClueId));
+    assert.ok(m.characters.every(c => c.clues.some(clue => clue.unlockRound === 1)));
+    assert.deepEqual(new Set(evidenceAtRound(m, 3).map(c => c.id)), new Set(m.solutionClueIds));
+  }
 });
 test('model deadline releases a hung caller', async () => {
   await assert.rejects(withDeadline(new Promise(() => {}), 5), /timed out/);
@@ -107,6 +141,69 @@ async function roomFixture(n = 4, env = {}) {
   const storage = new Map([['room', { code: 'TEST', hostToken: 'host', phase: 'lobby', players, round: 0, revision: 0, answers: {}, votes: {}, questions: [], expiresAt: Date.now() + 86400000 }]]);
   const ctx = context(storage), room = new Room(ctx, env); await ctx.ready; return { room, ctx, storage };
 }
+test('room projections hide sealed evidence until its round, reconnect preserves unlocks, and reveal requires published clues', async () => {
+  const { room, storage } = await roomFixture(); await room.advance(); await room.save();
+  const m = room.room.mystery;
+  assert.deepEqual(room.view({ host: true }).evidence, []);
+  for (const c of m.characters) assert.deepEqual(room.view({ playerId: c.playerId }).role.clues, []);
+  for (let round = 1; round <= 3; round++) {
+    await room.advance(); await room.save();
+    const host = room.view({ host: true }), visible = new Set(host.evidence.map(c => c.id));
+    assert.equal(host.role, undefined);
+    assert.equal(host.public.seed, undefined);
+    for (const c of m.characters) {
+      const own = room.view({ playerId: c.playerId });
+      assert.ok(own.role.clues.every(clue => visible.has(clue.id)));
+      for (const clue of c.clues.filter(clue => clue.unlockRound > round)) assert.ok(!JSON.stringify(own).includes(clue.text));
+    }
+    const ctx = context(storage), restored = new Room(ctx, {}); await ctx.ready;
+    assert.deepEqual(restored.view({ playerId: 'p0' }), room.view({ playerId: 'p0' }));
+    room.room.answers = Object.fromEntries(room.room.questions.map(q => [q.playerId, 'I will compare the new evidence.'])); await room.advance();
+  }
+  await room.advance();
+  room.room.votes = Object.fromEntries(players.map(p => [p.id, p.id === 'p0' ? 'p1' : 'p0']));
+  const published = room.room.shownClueIds; room.room.shownClueIds = [];
+  await assert.rejects(room.advance(), /evidence must be shown/);
+  room.room.shownClueIds = published; await room.advance();
+  const hostSocket = socket({ host: true });
+  await room.webSocketMessage(hostSocket, JSON.stringify({ type: 'open-solution', id: 1 }));
+  const reveal = room.view({ host: true });
+  for (const [, id] of reveal.reveal.solution.matchAll(/\[(C\d+)\]/g)) assert.ok(published.includes(id));
+});
+test('solution opening is host-only, persisted and server-gated; phones receive compact details only after opening', async () => {
+  const { room, storage } = await roomFixture();
+  const host = socket({ host: true }), guest = socket({ playerId: 'p0' });
+  await room.webSocketMessage(host, JSON.stringify({ type: 'open-solution', id: 1 }));
+  assert.equal(host.messages.at(-1).ok, false);
+  room.room.mystery = fixture(); room.room.phase = 'reveal'; room.room.round = 3;
+  for (const auth of [{ host: true }, { playerId: 'p0' }]) {
+    const view = room.view(auth);
+    assert.equal(view.reveal.solution, undefined); assert.equal(view.reveal.why, undefined); assert.equal(view.reveal.details, undefined);
+    assert.equal(view.reveal.caseFileOpen, false);
+  }
+  const text = narrationChunks(room.room.mystery.solution)[0];
+  assert.equal((await room.tts(new Request('https://room/api/tts', { method: 'POST', body: JSON.stringify({ token: 'host', text }) }))).status, 400);
+  await room.webSocketMessage(guest, JSON.stringify({ type: 'open-solution', id: 2 }));
+  assert.equal(guest.messages.at(-1).ok, false); assert.equal(room.view({ playerId: 'p0' }).reveal.caseFileOpen, false);
+  await room.webSocketMessage(host, JSON.stringify({ type: 'open-solution', id: 3 }));
+  assert.equal(host.messages.at(-1).ok, true);
+  const hostView = room.view({ host: true }), phone = room.view({ playerId: 'p0' });
+  assert.ok(hostView.reveal.solution.includes(room.room.mystery.solution));
+  assert.equal(phone.reveal.solution, undefined); assert.ok(phone.reveal.why.length < 300);
+  assert.equal(phone.reveal.details.length, room.room.mystery.solutionClueIds.length);
+  const ctx = context(storage), restored = new Room(ctx, {}); await ctx.ready;
+  assert.deepEqual(restored.view({ playerId: 'p0' }).reveal, phone.reveal);
+  await restored.advance(); assert.equal(restored.room.caseFileOpen, false);
+});
+test('the server preserves all 600 accepted statement characters and rejects overlong updates rather than trimming', async () => {
+  const { room } = await roomFixture(); await room.advance(); await room.advance();
+  const id = room.room.questions[0].playerId, ws = socket({ playerId: id }), text = 'x'.repeat(600);
+  await room.webSocketMessage(ws, JSON.stringify({ type: 'answer', text, id: 1 }));
+  assert.equal(ws.messages.at(-1).ok, true); assert.equal(room.room.answers[id], text);
+  await room.webSocketMessage(ws, JSON.stringify({ type: 'answer', text: `${text}x`, id: 2 }));
+  assert.equal(ws.messages.at(-1).ok, false); assert.match(ws.messages.at(-1).error, /1–600/);
+  assert.equal(room.room.answers[id], text);
+});
 test('room status does not expose capabilities; interrupted preparation has a retry message', async () => {
   const missing = new Room(context(), {}); await missing.ctx.ready;
   assert.equal((await missing.fetch(new Request('https://room/status'))).status, 404);
@@ -173,7 +270,9 @@ test('3–8 player games finish with an exhausted AI allocation, including the l
     await room.advance(); assert.equal(room.room.phase, 'voting');
     const killer = room.room.mystery.characters.find(c => c.killer).playerId;
     room.room.votes = Object.fromEntries(room.room.players.map(p => [p.id, p.id === killer ? room.room.players.find(p => p.id !== killer).id : killer]));
-    await room.advance(); const reveal = room.view({ host: true }).reveal;
+    await room.advance();
+    await room.webSocketMessage(socket({ host: true }), JSON.stringify({ type: 'open-solution', id: 1 }));
+    const reveal = room.view({ host: true }).reveal;
     assert.equal(reveal.killerWins, false); assert.match(reveal.solution, new RegExp(`${n - 1} of ${n} votes`)); assert.equal(calls, 1);
     await room.advance(); assert.equal(room.room.phase, 'lobby'); assert.equal(room.room.mystery, undefined);
   }
