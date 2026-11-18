@@ -1,0 +1,14 @@
+name = "murder-mystery-party-local"
+main = "dist/worker.js"
+compatibility_date = "2026-01-15"
+
+[vars]
+MOCK_AI = "1"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "Room"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
