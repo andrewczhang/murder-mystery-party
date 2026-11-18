@@ -55,10 +55,10 @@ test('sitting-out phones get a private round note, safe empty cards, fresh clues
   context.visible = evidenceAtRound(mystery, 1);
   context.ownClues = mystery.characters[3].clues.filter(c => c.unlockRound === 1);
   run("state.phase = 'questions'; state.round = 1; state.evidence = visible; state.role.clues = ownClues; state.role.shareableClueId = ownClues[0].id; render();");
-  assert.match(app.innerHTML, /YOUR SIDE OF THE INVESTIGATION/);
+  assert.match(app.innerHTML, /Your side of the investigation/);
   assert.match(app.innerHTML, /Read your newly unlocked clue aloud/);
   assert.match(app.innerHTML, /Saved only on this phone/);
-  assert.match(app.innerHTML, /NEW EVIDENCE · ROUND 1/);
+  assert.match(app.innerHTML, /New evidence · Round 1/);
   listeners.input({ target: { id: 'theory', value: '<My private suspect>' } });
   assert.equal(saved.size, 1);
   run('render();'); assert.match(app.innerHTML, /&lt;My private suspect&gt;/);
